@@ -1,0 +1,78 @@
+# ======================
+# FLUTTER / DART
+# ======================
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+
+# Dart
+*.dart_snapshot
+*.dill
+# pubspec.lock  # Uncomment to ignore (not recommended for apps)
+
+# Generated files
+*.g.dart
+*.freezed.dart
+*.mocks.dart
+
+# Hive local DB files
+*.hive
+*.lock
+
+# iOS
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+ios/Runner/GeneratedPluginRegistrant.*
+ios/Flutter/App.framework
+ios/Flutter/engine/
+*.ipa
+
+# Android
+android/.gradle/
+android/local.properties
+android/app/google-services.json
+android/key.properties
+*.apk
+*.aab
+
+# macOS
+macos/Pods/
+macos/Flutter/GeneratedPluginRegistrant.swift
+macos/Flutter/Flutter-Debug.xcconfig
+macos/Flutter/Flutter-Release.xcconfig
+
+# Web
+lib/generated_plugin_registrant.dart
+
+# ======================
+# IDE & OS
+# ======================
+
+# VSCode
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# IntelliJ / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~

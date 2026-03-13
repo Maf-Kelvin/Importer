@@ -1,0 +1,112 @@
+# docker/docker-compose.yml
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    environment:
+      POSTGRES_USER: import_logistics_user
+      POSTGRES_PASSWORD: import_logistics_password
+      POSTGRES_DB: import_logistics
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U import_logistics_user -d import_logistics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://import_logistics_user:import_logistics_password@db:5432/import_logistics
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../app:/app/app
+      - ../uploads:/app/uploads
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  celery_worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - DATABASE_URL=postgresql://import_logistics_user:import_logistics_password@db:5432/import_logistics
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ../app:/app/app
+    command: celery -A app.core.celery_app worker --loglevel=info --concurrency=2
+
+  celery_beat:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - DATABASE_URL=postgresql://import_logistics_user:import_logistics_password@db:5432/import_logistics
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ../app:/app/app
+    command: celery -A app.core.celery_app beat --loglevel=info
+
+  flower:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - redis
+    command: celery -A app.core.celery_app flower --port=5555
+
+volumes:
+  postgres_data:
+  redis_data:
+
+
+
+
+
+
+
+
+
