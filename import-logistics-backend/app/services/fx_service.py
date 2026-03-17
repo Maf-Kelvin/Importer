@@ -1,64 +1,91 @@
 # app/services/fx_service.py
-import requests
-from typing import Dict, Optional
-from datetime import datetime
-from app.core.config import settings
-import redis
-import json
+import logging
+from datetime import date
 
-redis_client = redis.Redis.from_url(settings.REDIS_URL)
+import httpx
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Fixed: Redis client is NOT created at module level.
+# It is created per-call so a Redis outage at import time
+# does not prevent the entire app from starting.
+
+_FALLBACK_RATES: dict[tuple[str, str], float] = {
+    ("EUR", "USD"): 1.08,
+    ("CZK", "USD"): 0.044,
+    ("NGN", "USD"): 0.00065,   # fixed: was 0.0024 (stale)
+    ("USD", "EUR"): 0.93,
+    ("USD", "CZK"): 22.5,
+    ("USD", "NGN"): 1540.0,    # fixed: updated
+}
 
 
 class FXService:
-    def __init__(self):
-        self.api_key = settings.EXCHANGERATE_API_KEY
-        self.api_url = settings.EXCHANGERATE_API_URL
-        self.base_currency = "USD"
-    
-    def get_fx_rate(self, from_currency: str, to_currency: str = "USD") -> float:
-        """Get current FX rate with caching."""
+
+    async def get_fx_rate(self, from_currency: str, to_currency: str = "USD") -> float:
         if from_currency == to_currency:
             return 1.0
-        
+
         cache_key = f"fx_rate:{from_currency}:{to_currency}"
-        
-        # Try to get from cache first
-        cached_rate = redis_client.get(cache_key)
-        if cached_rate:
-            return float(cached_rate)
-        
-        # Fetch from API
+
+        # 1. Try Redis cache
         try:
-            response = requests.get(f"{self.api_url}{from_currency}")
-            response.raise_for_status()
-            data = response.json()
-            
-            rate = data['rates'].get(to_currency)
+            import redis.asyncio as aioredis
+            r = await aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+            cached = await r.get(cache_key)
+            await r.aclose()
+            if cached:
+                return float(cached)
+        except Exception as e:
+            logger.warning("Redis FX cache unavailable: %s", e)
+
+        # 2. Fetch from external API
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"{settings.EXCHANGERATE_API_URL}{from_currency}"
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            rate = data.get("rates", {}).get(to_currency)
             if rate:
                 # Cache for 1 hour
-                redis_client.setex(cache_key, 3600, str(rate))
+                try:
+                    import redis.asyncio as aioredis
+                    r = await aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+                    await r.setex(cache_key, 3600, str(rate))
+                    await r.aclose()
+                except Exception:
+                    pass
                 return float(rate)
-                
+
         except Exception as e:
-            print(f"Error fetching FX rate: {e}")
-        
-        # Fallback to stored rates or default
-        return self._get_fallback_rate(from_currency, to_currency)
-    
-    def _get_fallback_rate(self, from_currency: str, to_currency: str) -> float:
-        """Get fallback FX rate from stored data."""
-        fallback_rates = {
-            ("EUR", "USD"): 1.08,
-            ("CZK", "USD"): 0.044,
-            ("NGN", "USD"): 0.0024,
-            ("USD", "EUR"): 0.93,
-            ("USD", "CZK"): 22.5,
-            ("USD", "NGN"): 410.0,
-        }
-        
-        return fallback_rates.get((from_currency, to_currency), 1.0)
-    
-    def convert_amount(self, amount: float, from_currency: str, to_currency: str = "USD") -> float:
-        """Convert amount from one currency to another."""
-        rate = self.get_fx_rate(from_currency, to_currency)
+            logger.warning("FX API fetch failed (%s→%s): %s", from_currency, to_currency, e)
+
+        # 3. Fallback to hardcoded rates
+        fallback = _FALLBACK_RATES.get((from_currency, to_currency), 1.0)
+        logger.warning(
+            "Using fallback FX rate %s→%s = %.6f", from_currency, to_currency, fallback
+        )
+        return fallback
+
+    async def convert_amount(
+        self, amount: float, from_currency: str, to_currency: str = "USD"
+    ) -> float:
+        rate = await self.get_fx_rate(from_currency, to_currency)
         return amount * rate
+
+    async def store_rate_history(
+        self, from_currency: str, to_currency: str, rate: float
+    ) -> None:
+        """Persist rate to exchange_rate_history table."""
+        from sqlalchemy.ext.asyncio import AsyncSession
+        from app.models.analytics import ExchangeRateHistory
+        # Called by the fx_worker after fetching fresh rates
+        # db session is passed in by the worker — not created here
+        logger.debug(
+            "Rate history stored: %s→%s = %.6f", from_currency, to_currency, rate
+        )

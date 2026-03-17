@@ -1,122 +1,162 @@
 # app/services/scraper_service.py
-import requests
+import asyncio
+import logging
+import re
+from typing import Any, Optional
+
+import httpx
 from bs4 import BeautifulSoup
-from typing import List, Dict, Any, Optional
-from app.core.config import settings, PRICING_SOURCES
-from app.models.item import Item
-from app.core.database import SessionLocal
-import time
-import random
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Sources that require JS rendering — use Playwright
+_PLAYWRIGHT_SOURCES = {"mobile_de", "autoscout24"}
 
 
 class ScraperService:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': settings.SCRAPING_USER_AGENT
-        })
-    
-    def scrape_prices(self, item_id: int, source: str) -> List[Dict[str, Any]]:
-        """Scrape prices for an item from a specific source."""
+    """
+    Scrapes market prices from external sites.
+    Uses httpx + BeautifulSoup for static sites.
+    Falls back to Playwright for JS-rendered sites.
+    SessionLocal is NOT created here — callers pass item data directly.
+    """
+
+    async def scrape_prices(
+        self, item_name: str, category: str, source: str
+    ) -> list[dict[str, Any]]:
         if not settings.SCRAPING_ENABLED:
             return []
-        
-        db = SessionLocal()
+
         try:
-            item = db.query(Item).filter(Item.id == item_id).first()
-            if not item:
+            if source in _PLAYWRIGHT_SOURCES:
+                return await self._scrape_with_playwright(item_name, category, source)
+            return await self._scrape_with_httpx(item_name, category, source)
+        except Exception as e:
+            logger.error("Scraping failed for source=%s item=%r: %s", source, item_name, e)
+            return []
+
+    # ------------------------------------------------------------------
+    # httpx scraper (static HTML)
+    # ------------------------------------------------------------------
+    async def _scrape_with_httpx(
+        self, item_name: str, category: str, source: str
+    ) -> list[dict[str, Any]]:
+        url, currency, css_class = _SOURCE_CONFIG.get(source, (None, "USD", None))
+        if not url:
+            logger.warning("Unknown scraper source: %s", source)
+            return []
+
+        search_term = f"{item_name} {category}".replace(" ", "+")
+        search_url  = f"{url}/search?query={search_term}"
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=15,
+                headers={"User-Agent": settings.SCRAPING_USER_AGENT},
+                follow_redirects=True,
+            ) as client:
+                resp = await client.get(search_url)
+                resp.raise_for_status()
+
+            soup    = BeautifulSoup(resp.content, "html.parser")
+            results = self._parse_prices(soup, css_class, currency, search_url)
+
+            await asyncio.sleep(1.5)   # polite delay
+            return results
+
+        except httpx.HTTPStatusError as e:
+            logger.warning("HTTP %d from %s: %s", e.response.status_code, source, e)
+            return []
+
+    def _parse_prices(
+        self,
+        soup: BeautifulSoup,
+        css_class: Optional[str],
+        currency: str,
+        url: str,
+    ) -> list[dict[str, Any]]:
+        results = []
+        if not css_class:
+            return results
+
+        elements = soup.find_all("span", class_=css_class)[:5]
+        for el in elements:
+            price = self._extract_price(el.get_text())
+            if price:
+                results.append({
+                    "price":      price,
+                    "currency":   currency,
+                    "url":        url,
+                    "confidence": 0.75,
+                })
+        return results
+
+    # ------------------------------------------------------------------
+    # Playwright scraper (JS-rendered sites)
+    # ------------------------------------------------------------------
+    async def _scrape_with_playwright(
+        self, item_name: str, category: str, source: str
+    ) -> list[dict[str, Any]]:
+        try:
+            from playwright.async_api import async_playwright
+
+            search_term = f"{item_name} {category}"
+            url, currency, _ = _SOURCE_CONFIG.get(source, (None, "EUR", None))
+            if not url:
                 return []
-            
-            scraper_method = getattr(self, f'_scrape_{source}', None)
-            if scraper_method:
-                return scraper_method(item)
-            
+
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True)
+                page    = await browser.new_page(
+                    user_agent=settings.SCRAPING_USER_AGENT
+                )
+                await page.goto(
+                    f"{url}/search?query={search_term.replace(' ', '+')}",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+                # Generic price extraction — works across most listing pages
+                price_els = await page.query_selector_all("[class*='price']")
+                results   = []
+                for el in price_els[:5]:
+                    text  = await el.text_content()
+                    price = self._extract_price(text or "")
+                    if price:
+                        results.append({
+                            "price":      price,
+                            "currency":   currency,
+                            "url":        page.url,
+                            "confidence": 0.65,
+                        })
+                await browser.close()
+                return results
+
         except Exception as e:
-            print(f"Error scraping {source}: {e}")
-        finally:
-            db.close()
-        
-        return []
-    
-    def _scrape_jiji(self, item: Item) -> List[Dict[str, Any]]:
-        """Scrape prices from Jiji.ng."""
-        try:
-            # Build search query
-            search_term = f"{item.name} {item.category.value}".replace(" ", "+")
-            url = f"https://jiji.ng/search?query={search_term}"
-            
-            response = self.session.get(url, timeout=10)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            prices = []
-            # This is a simplified example - real scraping would need more robust selectors
-            price_elements = soup.find_all('div', class_='price')[:5]  # Limit to 5 results
-            
-            for element in price_elements:
-                price_text = element.get_text().strip()
-                # Extract numerical price (simplified)
-                price_value = self._extract_price(price_text)
-                if price_value:
-                    prices.append({
-                        'price': price_value,
-                        'currency': 'NGN',
-                        'url': url,
-                        'confidence': 0.7,
-                        'raw_data': price_text
-                    })
-            
-            return prices
-            
-        except Exception as e:
-            print(f"Error scraping Jiji: {e}")
+            logger.error("Playwright scrape failed for %s: %s", source, e)
             return []
-    
-    def _scrape_ebay(self, item: Item) -> List[Dict[str, Any]]:
-        """Scrape prices from eBay."""
-        try:
-            # Build search query
-            search_term = f"{item.name} {item.category.value}".replace(" ", "+")
-            url = f"https://www.ebay.com/sch/i.html?_nkw={search_term}"
-            
-            response = self.session.get(url, timeout=10)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            prices = []
-            # Simplified eBay scraping
-            price_elements = soup.find_all('span', class_='s-item__price')[:5]
-            
-            for element in price_elements:
-                price_text = element.get_text().strip()
-                price_value = self._extract_price(price_text)
-                if price_value:
-                    prices.append({
-                        'price': price_value,
-                        'currency': 'USD',
-                        'url': url,
-                        'confidence': 0.8,
-                        'raw_data': price_text
-                    })
-            
-            return prices
-            
-        except Exception as e:
-            print(f"Error scraping eBay: {e}")
-            return []
-    
-    def _extract_price(self, price_text: str) -> Optional[float]:
-        """Extract numerical price from text."""
-        import re
-        
-        # Remove currency symbols and extract numbers
-        price_match = re.search(r'[\d,]+\.?\d*', price_text.replace(',', ''))
-        if price_match:
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_price(text: str) -> Optional[float]:
+        cleaned = text.replace(",", "").replace(" ", "")
+        match   = re.search(r"\d+\.?\d*", cleaned)
+        if match:
             try:
-                return float(price_match.group())
+                return float(match.group())
             except ValueError:
                 pass
-        
         return None
-    
-    def _add_delay(self):
-        """Add random delay to avoid being blocked."""
-        time.sleep(random.uniform(1, 3))
+
+
+# Source config: (base_url, currency, price_css_class)
+_SOURCE_CONFIG: dict[str, tuple[str, str, Optional[str]]] = {
+    "jiji":       ("https://jiji.ng",           "NGN", "price"),
+    "ebay":       ("https://www.ebay.com/sch",   "USD", "s-item__price"),
+    "mobile_de":  ("https://www.mobile.de",      "EUR", None),   # Playwright
+    "autoscout24": ("https://www.autoscout24.com", "EUR", None),  # Playwright
+    "bazos_cz":   ("https://www.bazos.cz",       "CZK", "price"),
+}

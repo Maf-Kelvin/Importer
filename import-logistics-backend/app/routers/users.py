@@ -1,115 +1,129 @@
-# app/api/v1/users.py
-from typing import Any, List
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session
-from app.api.deps import get_db, get_current_active_user, get_admin_user
-from app.models.user import User
-from app.schemas.user import UserInDB, UserCreate, UserUpdate
-from app.schemas.common import PaginatedResponse
+# app/routers/users.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func, select
+
+from app.routers.deps import AdminUser, CurrentUser, DBDep
+from app.schemas.common import PagedResponse, PaginationParams
+from app.schemas.user import UserAdminCreate, UserAdminUpdate, UserInDB
 from app.services.auth_service import AuthService
+from app.models.user import User
 
 router = APIRouter()
 
 
-@router.get("/", response_model=PaginatedResponse[UserInDB])
-def get_users(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=100),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_admin_user)
-) -> Any:
-    """Get all users (admin only)."""
-    total = db.query(User).count()
-    users = db.query(User).offset(skip).limit(limit).all()
-    
-    return {
-        'items': users,
-        'total': total,
-        'page': (skip // limit) + 1,
-        'per_page': limit,
-        'pages': (total + limit - 1) // limit
-    }
+@router.get(
+    "/",
+    response_model=PagedResponse[UserInDB],
+    summary="List all users (admin only)",
+)
+async def list_users(
+    db: DBDep,
+    _: AdminUser,
+    params: PaginationParams = Depends(),
+):
+    total_result = await db.execute(select(func.count(User.id)))
+    total = total_result.scalar_one()
+
+    result = await db.execute(
+        select(User).offset(params.offset).limit(params.limit)
+    )
+    users = list(result.scalars().all())
+
+    return PagedResponse.create(users, total, params)
 
 
-@router.get("/me", response_model=UserInDB)
-def get_current_user_info(
-    current_user: User = Depends(get_current_active_user)
-) -> Any:
-    """Get current user information."""
+@router.get(
+    "/me",
+    response_model=UserInDB,
+    summary="Get current user profile",
+)
+async def get_me(current_user: CurrentUser):
     return current_user
 
 
-@router.put("/me", response_model=UserInDB)
-def update_current_user(
-    user_update: UserUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
-) -> Any:
-    """Update current user."""
-    auth_service = AuthService(db)
-    
-    # Users can only update their own basic info (not role/permissions)
-    allowed_updates = user_update.dict(exclude={'role', 'is_active'}, exclude_unset=True)
-    
-    for field, value in allowed_updates.items():
-        if field == 'password' and value:
-            from app.core.security import get_password_hash
-            setattr(current_user, 'hashed_password', get_password_hash(value))
-        elif field != 'password':
-            setattr(current_user, field, value)
-    
-    db.commit()
-    db.refresh(current_user)
-    return current_user
+@router.put(
+    "/me",
+    response_model=UserInDB,
+    summary="Update own profile (cannot change own role)",
+)
+async def update_me(
+    update: UserAdminUpdate,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    svc = AuthService(db)
+    # Strip role and is_active — users cannot self-escalate
+    data = update.model_dump(exclude_unset=True, exclude={"role", "is_active"})
+    return await svc.update_user(current_user, data)
 
 
-@router.post("/", response_model=UserInDB)
-def create_user(
-    user_create: UserCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_admin_user)
-) -> Any:
-    """Create new user (admin only)."""
-    auth_service = AuthService(db)
-    
-    if auth_service.get_user_by_email(user_create.email):
-        raise HTTPException(
-            status_code=400,
-            detail="User with this email already exists"
-        )
-    
-    if auth_service.get_user_by_username(user_create.username):
-        raise HTTPException(
-            status_code=400,
-            detail="User with this username already exists"
-        )
-    
-    return auth_service.create_user(user_create)
+@router.post(
+    "/",
+    response_model=UserInDB,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create user (admin only — any role allowed)",
+)
+async def create_user(
+    user_create: UserAdminCreate,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    svc = AuthService(db)
+    try:
+        return await svc.create_user(user_create, tenant_id=current_user.tenant_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
 
-@router.put("/{user_id}", response_model=UserInDB)
-def update_user(
-    user_id: int,
-    user_update: UserUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_admin_user)
-) -> Any:
-    """Update user (admin only)."""
-    user = db.query(User).filter(User.id == user_id).first()
+@router.get(
+    "/{user_id}",
+    response_model=UserInDB,
+    summary="Get user by ID (admin only)",
+)
+async def get_user(user_id: int, db: DBDep, _: AdminUser):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user   = result.scalar_one_or_none()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    
-    update_data = user_update.dict(exclude_unset=True)
-    for field, value in update_data.items():
-        if field == 'password' and value:
-            from app.core.security import get_password_hash
-            setattr(user, 'hashed_password', get_password_hash(value))
-        elif field != 'password':
-            setattr(user, field, value)
-    
-    db.commit()
-    db.refresh(user)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     return user
+
+
+@router.put(
+    "/{user_id}",
+    response_model=UserInDB,
+    summary="Update any user (admin only)",
+)
+async def update_user(
+    user_id: int,
+    update: UserAdminUpdate,
+    db: DBDep,
+    _: AdminUser,
+):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user   = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    svc  = AuthService(db)
+    data = update.model_dump(exclude_unset=True)
+    return await svc.update_user(user, data)
+
+
+@router.delete(
+    "/{user_id}",
+    summary="Deactivate user (admin only — soft disable, not delete)",
+)
+async def deactivate_user(user_id: int, db: DBDep, current_user: AdminUser):
+    if user_id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot deactivate your own account",
+        )
+    result = await db.execute(select(User).where(User.id == user_id))
+    user   = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    svc = AuthService(db)
+    await svc.update_user(user, {"is_active": False})
+    return {"message": f"User {user_id} deactivated"}
