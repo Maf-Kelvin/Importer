@@ -13,6 +13,14 @@ from app.core.config import settings
 # ------------------------------------------------------------------------------
 # Async engine — used by FastAPI and services
 # ------------------------------------------------------------------------------
+_connect_args: dict = {}
+if settings.DATABASE_PGBOUNCER:
+    # PgBouncer (transaction pooling) + asyncpg: disable prepared statements
+    _connect_args = {
+        "statement_cache_size": 0,
+        "prepared_statement_cache_size": 0,
+    }
+
 async_engine = create_async_engine(
     settings.DATABASE_URL,
     pool_size=settings.DATABASE_POOL_SIZE,
@@ -20,6 +28,7 @@ async_engine = create_async_engine(
     pool_timeout=settings.DATABASE_POOL_TIMEOUT,
     pool_pre_ping=True,       # verify connection health before use
     echo=settings.DEBUG,      # SQL logging in debug mode only
+    connect_args=_connect_args,
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -52,8 +61,23 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 # ------------------------------------------------------------------------------
 @asynccontextmanager
 async def transaction(session: AsyncSession):
-    async with session.begin():
-        yield session
+    """Run a unit of work and commit it, or roll it back on any error.
+
+    SQLAlchemy 2.x starts a transaction automatically on the first query, so a
+    plain ``session.begin()`` fails with "a transaction is already begun" when
+    the caller read something first (which every service method does). This
+    helper handles both cases.
+    """
+    if session.in_transaction():
+        try:
+            yield session
+            await session.commit()
+        except BaseException:
+            await session.rollback()
+            raise
+    else:
+        async with session.begin():
+            yield session
 
 
 # ------------------------------------------------------------------------------

@@ -6,7 +6,8 @@ x-common-env: &common-env
   DATABASE_URL:          postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
   REDIS_URL:             redis://redis:6379/0
   CELERY_BROKER_URL:     redis://redis:6379/0
-  CELERY_RESULT_BACKEND: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  CACHE_REDIS_URL:       redis://redis-cache:6379/0
   ENVIRONMENT:           development
   DEBUG:                 "true"
 
@@ -53,7 +54,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
     ports:
@@ -63,6 +64,35 @@ services:
       interval: 10s
       timeout:  3s
       retries:  3
+
+  # Disposable cache (LRU) kept separate from the durable state Redis above
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test:     ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout:  3s
+      retries:  3
+
+  # ── One-shot schema migration ──────────────────────────────────────
+  migrate:
+    build:
+      context:    ..
+      dockerfile: docker/Dockerfile
+      target:     development
+    restart: "no"
+    environment:
+      <<: *common-env
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ../app:/app/app
+      - ../alembic:/app/alembic
+    command: alembic upgrade head
 
   # ── FastAPI application ────────────────────────────────────────────
   web:
@@ -77,6 +107,8 @@ services:
     ports:
       - "8000:8000"
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       redis:
@@ -150,7 +182,7 @@ services:
       - ../app:/app/app
     command: >
       celery -A app.core.celery_app worker
-      --queues=fx_queue,notification_queue
+      --queues=fx_queue,notification_queue,default
       --loglevel=info
       --concurrency=2
       --hostname=worker-fx-notify@%h

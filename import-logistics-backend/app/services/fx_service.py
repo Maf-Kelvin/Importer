@@ -1,91 +1,91 @@
 # app/services/fx_service.py
 import logging
-from datetime import date
+from decimal import Decimal, InvalidOperation
 
 import httpx
 
 from app.core.config import settings
+from app.core.redis_clients import get_cache_redis
+from app.utils.money import convert, to_decimal
 
 logger = logging.getLogger(__name__)
 
-# Fixed: Redis client is NOT created at module level.
-# It is created per-call so a Redis outage at import time
-# does not prevent the entire app from starting.
-
-_FALLBACK_RATES: dict[tuple[str, str], float] = {
-    ("EUR", "USD"): 1.08,
-    ("CZK", "USD"): 0.044,
-    ("NGN", "USD"): 0.00065,   # fixed: was 0.0024 (stale)
-    ("USD", "EUR"): 0.93,
-    ("USD", "CZK"): 22.5,
-    ("USD", "NGN"): 1540.0,    # fixed: updated
+# Development / emergency fallback only. These are NOT used in production
+# unless FX_ALLOW_FALLBACK=true, because silently using a stale hard-coded
+# rate for a financial calculation is worse than failing loudly.
+_FALLBACK_RATES: dict[tuple[str, str], Decimal] = {
+    ("EUR", "USD"): Decimal("1.08"),
+    ("CZK", "USD"): Decimal("0.044"),
+    ("NGN", "USD"): Decimal("0.00065"),
+    ("USD", "EUR"): Decimal("0.93"),
+    ("USD", "CZK"): Decimal("22.5"),
+    ("USD", "NGN"): Decimal("1540"),
 }
+
+
+class FXRateUnavailable(Exception):
+    """No trustworthy exchange rate could be obtained."""
+
+
+def _fallback_allowed() -> bool:
+    return settings.ENVIRONMENT != "production" or settings.FX_ALLOW_FALLBACK
 
 
 class FXService:
 
-    async def get_fx_rate(self, from_currency: str, to_currency: str = "USD") -> float:
+    async def get_fx_rate(self, from_currency: str, to_currency: str = "USD") -> Decimal:
+        from_currency, to_currency = from_currency.upper(), to_currency.upper()
         if from_currency == to_currency:
-            return 1.0
+            return Decimal("1")
 
         cache_key = f"fx_rate:{from_currency}:{to_currency}"
 
-        # 1. Try Redis cache
+        # 1. Cache (disposable Redis)
         try:
-            import redis.asyncio as aioredis
-            r = await aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-            cached = await r.get(cache_key)
-            await r.aclose()
+            cached = await get_cache_redis().get(cache_key)
             if cached:
-                return float(cached)
-        except Exception as e:
-            logger.warning("Redis FX cache unavailable: %s", e)
+                return to_decimal(cached)
+        except Exception as exc:
+            logger.warning("FX cache unavailable: %s", exc)
 
-        # 2. Fetch from external API
+        # 2. Live provider
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(
-                    f"{settings.EXCHANGERATE_API_URL}{from_currency}"
-                )
+                resp = await client.get(f"{settings.EXCHANGERATE_API_URL}{from_currency}")
                 resp.raise_for_status()
                 data = resp.json()
+            raw = data.get("rates", {}).get(to_currency)
+            if raw is not None:
+                rate = to_decimal(raw)
+                if rate > 0:
+                    try:
+                        await get_cache_redis().setex(cache_key, 3600, str(rate))
+                    except Exception as exc:
+                        logger.warning("Could not cache FX rate: %s", exc)
+                    return rate
+        except (httpx.HTTPError, ValueError, InvalidOperation) as exc:
+            logger.warning("FX fetch failed (%s->%s): %s", from_currency, to_currency, exc)
 
-            rate = data.get("rates", {}).get(to_currency)
-            if rate:
-                # Cache for 1 hour
-                try:
-                    import redis.asyncio as aioredis
-                    r = await aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-                    await r.setex(cache_key, 3600, str(rate))
-                    await r.aclose()
-                except Exception:
-                    pass
-                return float(rate)
+        # 3. Fallback - explicit, logged, and never silent in production
+        fallback = _FALLBACK_RATES.get((from_currency, to_currency))
+        if fallback is not None and _fallback_allowed():
+            logger.warning(
+                "USING FALLBACK FX RATE %s->%s = %s", from_currency, to_currency, fallback
+            )
+            return fallback
 
-        except Exception as e:
-            logger.warning("FX API fetch failed (%s→%s): %s", from_currency, to_currency, e)
-
-        # 3. Fallback to hardcoded rates
-        fallback = _FALLBACK_RATES.get((from_currency, to_currency), 1.0)
-        logger.warning(
-            "Using fallback FX rate %s→%s = %.6f", from_currency, to_currency, fallback
+        raise FXRateUnavailable(
+            f"No exchange rate available for {from_currency}->{to_currency}"
         )
-        return fallback
 
     async def convert_amount(
-        self, amount: float, from_currency: str, to_currency: str = "USD"
-    ) -> float:
+        self, amount: Decimal, from_currency: str, to_currency: str = "USD"
+    ) -> Decimal:
         rate = await self.get_fx_rate(from_currency, to_currency)
-        return amount * rate
+        return convert(amount, rate)
 
     async def store_rate_history(
-        self, from_currency: str, to_currency: str, rate: float
+        self, from_currency: str, to_currency: str, rate: Decimal
     ) -> None:
-        """Persist rate to exchange_rate_history table."""
-        from sqlalchemy.ext.asyncio import AsyncSession
-        from app.models.analytics import ExchangeRateHistory
-        # Called by the fx_worker after fetching fresh rates
-        # db session is passed in by the worker — not created here
-        logger.debug(
-            "Rate history stored: %s→%s = %.6f", from_currency, to_currency, rate
-        )
+        """Placeholder hook: persistence is done by fx_worker, not here."""
+        logger.debug("FX rate observed: %s->%s = %s", from_currency, to_currency, rate)

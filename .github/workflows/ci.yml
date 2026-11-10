@@ -1,0 +1,122 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: import-logistics-backend
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/test
+      TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Static checks (imports resolve, no undefined names)
+        run: |
+          python scripts/check_imports.py
+          python scripts/check_names.py
+          python scripts/check_migration.py
+      - name: Unit and integration tests
+        run: pytest -q --cov=app --cov-report=term-missing
+      - name: Migrations build a clean database, match the models, and undo cleanly
+        run: |
+          alembic upgrade head
+          alembic check
+          alembic downgrade base
+          alembic upgrade head
+          alembic check
+
+  e2e:
+    # Boots the real stack with Docker Compose and runs the smoke test.
+    # The baseline migration (alembic/versions/001_baseline.py) is committed.
+    runs-on: ubuntu-latest
+    needs: test
+    defaults:
+      run:
+        working-directory: import-logistics-backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install httpx
+      - name: Create .env
+        run: |
+          cp .env.example .env
+          {
+            echo "SECRET_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(64))')"
+            echo "POSTGRES_PASSWORD=ci-postgres-password"
+            echo "FLOWER_PASSWORD=ci-flower-password"
+            echo "GRAFANA_PASSWORD=ci-grafana-password"
+            echo "FIRST_SUPERUSER_EMAIL=root@example.com"
+            echo "FIRST_SUPERUSER_USERNAME=root"
+            echo "FIRST_SUPERUSER_PASSWORD=Root-Ci-Passw0rd-123"
+          } >> .env
+      - name: Start stack
+        run: docker compose -f docker/docker-compose.yml --env-file .env up -d --build
+      - name: Wait for API
+        run: |
+          for i in $(seq 1 60); do
+            curl -fs http://localhost:8000/ready && exit 0
+            sleep 3
+          done
+          docker compose -f docker/docker-compose.yml logs --tail=100
+          exit 1
+      - name: Create platform administrator
+        run: |
+          docker compose -f docker/docker-compose.yml exec -T \
+            -e FIRST_SUPERUSER_EMAIL=root@example.com -e FIRST_SUPERUSER_USERNAME=root \
+            -e FIRST_SUPERUSER_PASSWORD=Root-Ci-Passw0rd-123 web python -m scripts.init_db
+      - name: Smoke test
+        run: python scripts/smoke_test.py --base-url http://localhost:8000 --username root --password Root-Ci-Passw0rd-123
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f docker/docker-compose.yml logs --tail=200
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm install
+      - name: Every local import resolves
+        run: npm run check:imports
+      - name: Types still match the real API (openapi.json)
+        run: npm run check:contract
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  images:
+    # The production image builds the frontend and bundles nginx: catches a broken Dockerfile or type error.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f import-logistics-backend/docker/nginx/Dockerfile -t importer-nginx .

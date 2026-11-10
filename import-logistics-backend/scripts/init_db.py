@@ -1,68 +1,71 @@
 # scripts/init_db.py
-"""Initialize database with tables and first superuser."""
+"""Bootstrap the first organisation (tenant) and superuser.
 
-import asyncio
-from sqlalchemy.orm import Session
-from app.core.database import SessionLocal, engine
+This script does NOT create tables. Run `alembic upgrade head` first.
+
+Required environment variables:
+    FIRST_SUPERUSER_EMAIL, FIRST_SUPERUSER_USERNAME, FIRST_SUPERUSER_PASSWORD
+"""
+import sys
+
+from sqlalchemy import inspect, select
+
 from app.core.config import settings
-from app.models import Base
-from app.models.user import User, UserRole
+from app.core.database import SyncSessionLocal, sync_engine
 from app.core.security import get_password_hash
+from app.models.organization import Organization
+from app.models.user import User, UserRole
+
+DEFAULT_ORG_SLUG = "default"
 
 
-def create_tables():
-    """Create all database tables."""
-    print("Creating database tables...")
-    Base.metadata.create_all(bind=engine)
-    print("✅ Database tables created successfully!")
+def main() -> int:
+    email = settings.FIRST_SUPERUSER_EMAIL
+    username = settings.FIRST_SUPERUSER_USERNAME
+    password = settings.FIRST_SUPERUSER_PASSWORD
+    if not (email and username and password):
+        print("Set FIRST_SUPERUSER_EMAIL, FIRST_SUPERUSER_USERNAME and FIRST_SUPERUSER_PASSWORD.")
+        return 1
+    if settings.ENVIRONMENT == "production" and len(password) < 12:
+        print("In production the superuser password must be at least 12 characters.")
+        return 1
+    if not inspect(sync_engine).has_table("organizations"):
+        print("Tables not found. Run `alembic upgrade head` first.")
+        return 1
 
+    with SyncSessionLocal() as db:
+        org = db.execute(
+            select(Organization).where(Organization.slug == DEFAULT_ORG_SLUG)
+        ).scalar_one_or_none()
+        if org is None:
+            org = Organization(name="Default Organization", slug=DEFAULT_ORG_SLUG)
+            db.add(org)
+            db.flush()
 
-def create_first_superuser(db: Session):
-    """Create the first superuser."""
-    print("Creating first superuser...")
-    
-    # Check if superuser already exists
-    existing_user = db.query(User).filter(User.email == settings.FIRST_SUPERUSER).first()
-    if existing_user:
-        print(f"⚠️  Superuser {settings.FIRST_SUPERUSER} already exists!")
-        return
-    
-    # Create superuser
-    superuser = User(
-        email=settings.FIRST_SUPERUSER,
-        username="admin",
-        first_name="Super",
-        last_name="Admin",
-        hashed_password=get_password_hash(settings.FIRST_SUPERUSER_PASSWORD),
-        role=UserRole.ADMIN,
-        is_active=True,
-        is_superuser=True
-    )
-    
-    db.add(superuser)
-    db.commit()
-    
-    print(f"✅ Superuser {settings.FIRST_SUPERUSER} created successfully!")
-    print(f"   Username: admin")
-    print(f"   Password: {settings.FIRST_SUPERUSER_PASSWORD}")
+        exists = db.execute(
+            select(User).where((User.email == email) | (User.username == username))
+        ).scalar_one_or_none()
+        if exists:
+            print("Superuser already exists - nothing to do.")
+            return 0
 
-
-def main():
-    """Main initialization function."""
-    print("🚀 Initializing Import Logistics Database...")
-    
-    # Create tables
-    create_tables()
-    
-    # Create first superuser
-    db = SessionLocal()
-    try:
-        create_first_superuser(db)
-    finally:
-        db.close()
-    
-    print("🎉 Database initialization completed!")
+        db.add(
+            User(
+                tenant_id=org.id,
+                email=email,
+                username=username,
+                first_name="Super",
+                last_name="Admin",
+                hashed_password=get_password_hash(password),
+                role=UserRole.ADMIN,
+                is_active=True,
+                is_superuser=True,
+            )
+        )
+        db.commit()
+    print(f"Created organisation '{DEFAULT_ORG_SLUG}' and superuser '{username}'.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -87,6 +87,17 @@ async def get_admin_user(
     return current_user
 
 
+async def get_superuser(
+    current_user: User = Depends(get_current_active_user),
+) -> User:
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Platform administrator access required",
+        )
+    return current_user
+
+
 async def get_manager_or_admin_user(
     current_user: User = Depends(get_current_active_user),
 ) -> User:
@@ -123,4 +134,5 @@ DBDep      = Annotated[AsyncSession, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_active_user)]
 AdminUser   = Annotated[User, Depends(get_admin_user)]
 ManagerUser = Annotated[User, Depends(get_manager_or_admin_user)]
+SuperUser   = Annotated[User, Depends(get_superuser)]
 ClerkUser   = Annotated[User, Depends(get_clerk_or_higher_user)]

@@ -28,7 +28,7 @@ async def readiness():
             await conn.execute(sqlalchemy.text("SELECT 1"))
         checks["database"] = "ok"
     except Exception as e:
-        checks["database"] = f"error: {e}"
+        checks["database"] = "error"
         healthy = False
 
     try:
@@ -37,7 +37,7 @@ async def readiness():
         await r.aclose()
         checks["redis"] = "ok"
     except Exception as e:
-        checks["redis"] = f"error: {e}"
+        checks["redis"] = "error"
         healthy = False
 
     return ORJSONResponse(

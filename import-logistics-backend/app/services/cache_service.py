@@ -7,6 +7,7 @@ import redis.asyncio as aioredis
 from pydantic import BaseModel
 
 from app.core.config import settings
+from app.core.redis_clients import get_cache_redis
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +44,8 @@ class CacheService:
     """
 
     async def _client(self) -> aioredis.Redis:
-        return await aioredis.from_url(
-            settings.REDIS_URL, decode_responses=True
-        )
+        # Disposable cache instance (LRU eviction); never the durable state Redis
+        return get_cache_redis()
 
     # ------------------------------------------------------------------
     # Get
@@ -55,7 +55,6 @@ class CacheService:
         try:
             r      = await self._client()
             raw    = await r.get(key)
-            await r.aclose()
             if raw:
                 return model.model_validate_json(raw)
         except Exception as e:
@@ -67,7 +66,6 @@ class CacheService:
         try:
             r   = await self._client()
             raw = await r.get(key)
-            await r.aclose()
             if raw:
                 return json.loads(raw)
         except Exception as e:
@@ -86,7 +84,6 @@ class CacheService:
             else:
                 payload = json.dumps(value)
             await r.setex(key, ttl, payload)
-            await r.aclose()
             return True
         except Exception as e:
             logger.warning("Cache SET failed key=%s: %s", key, e)
@@ -99,7 +96,6 @@ class CacheService:
         try:
             r = await self._client()
             await r.delete(key)
-            await r.aclose()
             return True
         except Exception as e:
             logger.warning("Cache DELETE failed key=%s: %s", key, e)
@@ -117,7 +113,6 @@ class CacheService:
             keys = await r.keys(pattern)
             if keys:
                 deleted = await r.delete(*keys)
-            await r.aclose()
         except Exception as e:
             logger.warning("Cache INVALIDATE_PATTERN failed pattern=%s: %s", pattern, e)
         return deleted

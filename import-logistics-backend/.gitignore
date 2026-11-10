@@ -56,3 +56,7 @@ docker/secrets/
 # Logs
 *.log
 logs/
+
+# TLS material
+docker/nginx/ssl/*.pem
+docker/nginx/ssl/*.key

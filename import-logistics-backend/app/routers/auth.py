@@ -1,8 +1,10 @@
 # app/routers/auth.py
+import logging
+import time
 from datetime import timedelta
-from typing import Annotated
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +21,35 @@ from app.schemas.user import (
 from app.services.auth_service import AuthService
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+AUTH_MODE_HEADER = "x-auth-mode"
+COOKIE_PATH = "/api/v1/auth"
+
+
+def _cookie_mode(request: Request) -> bool:
+    """Browsers send `X-Auth-Mode: cookie`. The custom header also acts as a CSRF guard:
+    a cross-site form or image request cannot set it."""
+    return request.headers.get(AUTH_MODE_HEADER, "").lower() == "cookie"
+
+
+def _set_refresh_cookie(response: Response, token: str) -> None:
+    secure = settings.COOKIE_SECURE if settings.COOKIE_SECURE is not None else settings.ENVIRONMENT == "production"
+    response.set_cookie(
+        key=settings.REFRESH_COOKIE_NAME,
+        value=token,
+        max_age=settings.REFRESH_TOKEN_EXPIRE_MINUTES * 60,
+        httponly=True,          # JavaScript can never read it
+        secure=secure,          # HTTPS only in production
+        samesite="strict",      # never sent on cross-site requests
+        path=COOKIE_PATH,       # only sent to the auth endpoints
+    )
+
+
+def _clear_refresh_cookie(response: Response) -> None:
+    response.delete_cookie(key=settings.REFRESH_COOKIE_NAME, path=COOKIE_PATH)
+
 
 
 @router.post(
@@ -28,6 +59,7 @@ router = APIRouter()
 )
 async def login(
     request: Request,
+    response: Response,
     db: DBDep,
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
 ):
@@ -59,6 +91,10 @@ async def login(
         expires_delta=timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES),
     )
 
+    if _cookie_mode(request):
+        _set_refresh_cookie(response, refresh_token)
+        refresh_token = None
+
     return Token(
         access_token=access_token,
         refresh_token=refresh_token,
@@ -72,16 +108,26 @@ async def login(
     response_model=Token,
     summary="Exchange a refresh token for a new access token",
 )
-async def refresh_token(body: TokenRefresh, db: DBDep):
+async def refresh_token(
+    request: Request,
+    response: Response,
+    db: DBDep,
+    body: Optional[TokenRefresh] = None,
+):
+    cookie_mode = _cookie_mode(request)
+    token = request.cookies.get(settings.REFRESH_COOKIE_NAME) if cookie_mode else (body.refresh_token if body else None)
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token missing")
+
     # Verify not blacklisted
-    if await security.is_token_blacklisted(body.refresh_token):
+    if await security.is_token_blacklisted(token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has been revoked",
         )
 
     try:
-        payload = security.decode_token(body.refresh_token)
+        payload = security.decode_token(token)
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -105,10 +151,15 @@ async def refresh_token(body: TokenRefresh, db: DBDep):
             detail="User not found or inactive",
         )
 
-    # Rotate — blacklist old refresh token
-    remaining = payload.get("exp", 0) - int(__import__("time").time())
-    if remaining > 0:
-        await security.blacklist_token(body.refresh_token, remaining)
+    # Rotate: revoke the old refresh token ATOMICALLY. Checking "is it revoked?" and revoking it
+    # as two steps let two simultaneous requests both succeed. SET NX lets exactly one through.
+    remaining = max(payload.get("exp", 0) - int(time.time()), 1)
+    if not await security.consume_token(token, remaining):
+        logger.warning("Refresh token reuse rejected for user=%s", user.username)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token has been revoked",
+        )
 
     new_access = security.create_access_token(
         subject=user.username,
@@ -119,6 +170,10 @@ async def refresh_token(body: TokenRefresh, db: DBDep):
         subject=user.username,
         tenant_id=user.tenant_id,
     )
+
+    if cookie_mode:
+        _set_refresh_cookie(response, new_refresh)
+        new_refresh = None
 
     return Token(
         access_token=new_access,
@@ -131,13 +186,18 @@ async def refresh_token(body: TokenRefresh, db: DBDep):
 @router.post(
     "/logout",
     response_model=dict,
-    summary="Revoke access + refresh tokens",
+    summary="Sign out: revoke the presented tokens and clear the session cookie",
 )
 async def logout(
     request: Request,
-    body: LogoutRequest,
-    current_user=Depends(get_current_active_user),
+    response: Response,
+    body: Optional[LogoutRequest] = None,
 ):
+    """Revoke the tokens the caller presents and clear the session cookie.
+
+    Deliberately NOT behind authentication: a user whose 30-minute access token has expired
+    must still be able to sign out (the refresh cookie is the credential that needs revoking),
+    and it can only ever revoke tokens the caller already holds."""
     # Blacklist the access token from the Authorization header
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
@@ -150,14 +210,19 @@ async def logout(
         except Exception:
             pass
 
-    # Blacklist the refresh token
-    try:
-        payload = security.decode_token(body.refresh_token)
-        remaining = payload.get("exp", 0) - int(__import__("time").time())
-        if remaining > 0:
-            await security.blacklist_token(body.refresh_token, remaining)
-    except Exception:
-        pass
+    # Blacklist the refresh token (from the httpOnly cookie in web mode, else from the body)
+    cookie_mode = _cookie_mode(request)
+    refresh = request.cookies.get(settings.REFRESH_COOKIE_NAME) if cookie_mode else (body.refresh_token if body else None)
+    if refresh:
+        try:
+            payload = security.decode_token(refresh)
+            remaining = payload.get("exp", 0) - int(__import__("time").time())
+            if remaining > 0:
+                await security.blacklist_token(refresh, remaining)
+        except Exception:
+            pass
+    if cookie_mode:
+        _clear_refresh_cookie(response)
 
     return {"message": "Logged out successfully"}
 
@@ -172,8 +237,13 @@ async def register(user_create: UserCreate, db: DBDep):
     """
     Public registration. Role is restricted to viewer/clerk/manager
     by the UserCreate schema validator — admin cannot self-register.
-    In production, set REGISTRATION_OPEN=false and use admin POST /users/.
+    Disabled unless REGISTRATION_OPEN=true; otherwise an admin creates users via POST /users/.
     """
+    if not settings.REGISTRATION_OPEN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Self-registration is disabled. Ask an administrator to create your account.",
+        )
     svc = AuthService(db)
 
     try:

@@ -17,6 +17,14 @@ from app.schemas.container import ContainerCreate, ContainerUpdate
 from app.schemas.expense import ExpenseCreate, ExpenseUpdate
 from app.schemas.item import ItemCreate, ItemUpdate, MarkSoldRequest
 from app.services.fx_service import FXService
+from app.services.audit_service import AuditService
+from app.utils.audit import diff, snapshot
+from app.utils.money import convert
+
+CONTAINER_FIELDS = ("name", "container_type", "msc_container_number", "allocation_method", "notes", "is_sealed")
+EXPENSE_FIELDS = ("container_id", "expense_type", "amount", "currency", "fx_rate_to_usd", "amount_usd", "description")
+ITEM_FIELDS = ("container_id", "name", "category", "condition", "purchase_price", "purchase_currency",
+               "fx_rate_to_usd", "purchase_price_usd", "weight", "volume", "selling_price", "sold")
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +33,7 @@ class ContainerService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
         self.fx  = FXService()
+        self.audit = AuditService(db)
 
     # ==================================================================
     # Containers
@@ -44,6 +53,10 @@ class ContainerService:
                 notes=data.notes,
             )
             self.db.add(container)
+            await self.db.flush()
+            self.audit.add(tenant_id=owner.tenant_id, user_id=owner.id, action="container.created",
+                           entity_type="Container", entity_id=container.id,
+                           changes=snapshot(container, CONTAINER_FIELDS))
         await self.db.refresh(container)
         logger.info("Container created: id=%d owner=%d", container.id, owner.id)
         return container
@@ -101,7 +114,8 @@ class ContainerService:
                 Container.deleted_at.is_(None),
             )
             .options(
-                selectinload(Container.items),
+                # soft-deleted items must not reappear in the container view
+                selectinload(Container.items.and_(Item.deleted_at.is_(None))),
                 selectinload(Container.expenses),
             )
         )
@@ -121,9 +135,13 @@ class ContainerService:
         if not container:
             return None
 
+        before = snapshot(container, CONTAINER_FIELDS)
         async with transaction(self.db):
             for field, value in data.model_dump(exclude_unset=True).items():
                 setattr(container, field, value)
+            self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="container.updated",
+                           entity_type="Container", entity_id=container.id,
+                           changes=diff(before, snapshot(container, CONTAINER_FIELDS)))
 
         await self.db.refresh(container)
         return container
@@ -136,6 +154,8 @@ class ContainerService:
             return None
         async with transaction(self.db):
             container.is_sealed = True
+            self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="container.sealed",
+                           entity_type="Container", entity_id=container.id)
         await self.db.refresh(container)
         return container
 
@@ -147,6 +167,8 @@ class ContainerService:
             return False
         async with transaction(self.db):
             container.soft_delete()
+            self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="container.deleted",
+                           entity_type="Container", entity_id=container.id)
         logger.info("Container soft-deleted: id=%d by user=%d", container_id, current_user.id)
         return True
 
@@ -162,7 +184,7 @@ class ContainerService:
             return None
 
         fx_rate   = await self.fx.get_fx_rate(data.currency, "USD")
-        amount_usd = data.amount * fx_rate
+        amount_usd = convert(data.amount, fx_rate)
 
         async with transaction(self.db):
             expense = ContainerExpense(
@@ -176,6 +198,10 @@ class ContainerService:
                 amount_usd=amount_usd,
             )
             self.db.add(expense)
+            await self.db.flush()
+            self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="expense.created",
+                           entity_type="ContainerExpense", entity_id=expense.id,
+                           changes=snapshot(expense, EXPENSE_FIELDS))
 
         await self.db.refresh(expense)
         return expense
@@ -209,16 +235,29 @@ class ContainerService:
         expense = result.scalar_one_or_none()
         if not expense:
             return None
+        # Same visibility rule as the container (clerks: own containers only)
+        if not await self.get_container_by_id(expense.container_id, current_user):
+            return None
 
+        update_data = data.model_dump(exclude_unset=True)
+        # Network call happens BEFORE the transaction so no DB connection is
+        # held open while we wait for the FX provider.
+        fx_rate = None
+        if "amount" in update_data or "currency" in update_data:
+            fx_rate = await self.fx.get_fx_rate(
+                update_data.get("currency", expense.currency), "USD"
+            )
+
+        before = snapshot(expense, EXPENSE_FIELDS)
         async with transaction(self.db):
-            update_data = data.model_dump(exclude_unset=True)
             for field, value in update_data.items():
                 setattr(expense, field, value)
-            # Recalculate USD amount if currency or amount changed
-            if "amount" in update_data or "currency" in update_data:
-                fx_rate = await self.fx.get_fx_rate(expense.currency, "USD")
+            if fx_rate is not None:
                 expense.fx_rate_to_usd = fx_rate
-                expense.amount_usd = expense.amount * fx_rate
+                expense.amount_usd = convert(expense.amount, fx_rate)
+            self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="expense.updated",
+                           entity_type="ContainerExpense", entity_id=expense.id,
+                           changes=diff(before, snapshot(expense, EXPENSE_FIELDS)))
 
         await self.db.refresh(expense)
         return expense
@@ -235,7 +274,12 @@ class ContainerService:
         expense = result.scalar_one_or_none()
         if not expense:
             return False
+        if not await self.get_container_by_id(expense.container_id, current_user):
+            return False
         async with transaction(self.db):
+            self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="expense.deleted",
+                           entity_type="ContainerExpense", entity_id=expense.id,
+                           changes=snapshot(expense, EXPENSE_FIELDS))
             await self.db.delete(expense)
         return True
 
@@ -251,7 +295,7 @@ class ContainerService:
             return None
 
         fx_rate            = await self.fx.get_fx_rate(data.purchase_currency, "USD")
-        purchase_price_usd = data.purchase_price * fx_rate
+        purchase_price_usd = convert(data.purchase_price, fx_rate)
 
         async with transaction(self.db):
             item = Item(
@@ -270,6 +314,9 @@ class ContainerService:
                 volume=data.volume,
             )
             self.db.add(item)
+            await self.db.flush()
+            self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="item.created",
+                           entity_type="Item", entity_id=item.id, changes=snapshot(item, ITEM_FIELDS))
 
         await self.db.refresh(item)
         logger.info("Item created: id=%d container=%d", item.id, item.container_id)
@@ -344,17 +391,24 @@ class ContainerService:
         if not item:
             return None
 
+        update_data = data.model_dump(exclude_unset=True)
+        fx_rate = None
+        price = None
+        if "purchase_price" in update_data or "purchase_currency" in update_data:
+            currency = update_data.get("purchase_currency", item.purchase_currency)
+            price    = update_data.get("purchase_price",    item.purchase_price)
+            fx_rate  = await self.fx.get_fx_rate(currency, "USD")
+
+        before = snapshot(item, ITEM_FIELDS)
         async with transaction(self.db):
-            update_data = data.model_dump(exclude_unset=True)
-            # Recalculate USD price if purchase price or currency changed
-            if "purchase_price" in update_data or "purchase_currency" in update_data:
-                currency = update_data.get("purchase_currency", item.purchase_currency)
-                price    = update_data.get("purchase_price",    item.purchase_price)
-                fx_rate  = await self.fx.get_fx_rate(currency, "USD")
+            if fx_rate is not None:
                 item.fx_rate_to_usd     = fx_rate
-                item.purchase_price_usd = price * fx_rate
+                item.purchase_price_usd = convert(price, fx_rate)
             for field, value in update_data.items():
                 setattr(item, field, value)
+            self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="item.updated",
+                           entity_type="Item", entity_id=item.id,
+                           changes=diff(before, snapshot(item, ITEM_FIELDS)))
 
         await self.db.refresh(item)
         return item
@@ -367,6 +421,8 @@ class ContainerService:
             return False
         async with transaction(self.db):
             item.soft_delete()
+            self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="item.deleted",
+                           entity_type="Item", entity_id=item.id, changes=snapshot(item, ITEM_FIELDS))
         return True
 
     async def mark_item_sold(
@@ -380,6 +436,20 @@ class ContainerService:
         item = await self.get_item_by_id(item_id, current_user)
         if not item or item.sold:
             return None
+
+        if data.customer_id is not None:
+            from app.models.commerce import Customer
+            customer = (
+                await self.db.execute(
+                    select(Customer.id).where(
+                        Customer.id == data.customer_id,
+                        Customer.tenant_id == current_user.tenant_id,
+                        Customer.deleted_at.is_(None),
+                    )
+                )
+            ).first()
+            if customer is None:
+                raise ValueError("Customer not found")
 
         async with transaction(self.db):
             sold_at = datetime.combine(
@@ -402,6 +472,9 @@ class ContainerService:
                 notes=data.notes,
             )
             self.db.add(sale)
+            self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="item.sold",
+                           entity_type="Item", entity_id=item.id,
+                           changes={"selling_price": str(data.selling_price), "sold_date": str(item.sold_date)})
 
         await self.db.refresh(item)
         logger.info(
@@ -425,4 +498,14 @@ class ContainerService:
         if not container:
             return None
         svc = CostAllocationService(self.db)
-        return await svc.allocate_container_costs(container_id, allocation_method)
+        result = await svc.allocate_container_costs(
+            container_id, container.tenant_id, allocation_method
+        )
+        if result is not None:
+            await self.audit.record(
+                tenant_id=current_user.tenant_id, user_id=current_user.id, action="costs.allocated",
+                entity_type="Container", entity_id=container_id,
+                changes={"method": result["method"], "total_expenses": str(result["total_expenses"]),
+                         "items": len(result["items"])},
+            )
+        return result

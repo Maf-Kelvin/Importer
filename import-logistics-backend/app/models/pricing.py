@@ -1,7 +1,8 @@
 # app/models/pricing.py
 import enum
+from decimal import Decimal
 from sqlalchemy import (
-    Boolean, Float, ForeignKey, Index, Integer,
+    Boolean, Float, ForeignKey, Index, Integer, Numeric,
     String, Text, Enum as SQLEnum,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -42,7 +43,7 @@ class PriceRecord(BaseModel):
     # Pricing details
     method:   Mapped[PricingMethod]    = mapped_column(SQLEnum(PricingMethod), nullable=False)
     source:   Mapped[PricingSource|None] = mapped_column(SQLEnum(PricingSource), nullable=True)
-    price:    Mapped[float]            = mapped_column(Float, nullable=False)
+    price:    Mapped[Decimal]          = mapped_column(Numeric(18, 4), nullable=False)
     currency: Mapped[str]              = mapped_column(String(3), nullable=False, default="USD")
 
     # Market data

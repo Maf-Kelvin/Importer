@@ -12,6 +12,7 @@ from app.schemas.container import (
     ContainerWithItems,
 )
 from app.services.container_service import ContainerService
+from app.services.cost_allocation_service import AllocationError
 
 router = APIRouter()
 
@@ -132,7 +133,10 @@ async def allocate_costs(
     allocation_method: Optional[str] = Query(None, description="weight_based | value_based"),
 ):
     svc    = ContainerService(db)
-    result = await svc.allocate_costs(container_id, allocation_method, current_user)
+    try:
+        result = await svc.allocate_costs(container_id, allocation_method, current_user)
+    except AllocationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Container not found")
     return result

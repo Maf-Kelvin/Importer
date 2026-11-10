@@ -1,5 +1,5 @@
 # app/routers/tracking.py
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, HTTPException, status
 
 from app.routers.deps import ClerkUser, CurrentUser, DBDep
 from app.schemas.tracking import (
@@ -18,16 +18,19 @@ router = APIRouter()
 )
 async def trigger_tracking_update(
     container_id: int,
-    background_tasks: BackgroundTasks,
     db: DBDep,
-    current_user: CurrentUser,
+    current_user: ClerkUser,
 ):
-    # Enqueue via Celery so it doesn't block the HTTP response
+    # The caller must be allowed to see this container (same tenant; clerks: own only).
+    # Previously ANY user could queue an update for ANY tenant's container.
+    svc = TrackingService(db)
+    if not await svc._get_container_with_permission(container_id, current_user):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Container not found")
+
     from app.workers.tracking_worker import update_container_tracking
-    background_tasks.add_task(
-        update_container_tracking.apply_async,
-        args=[container_id],
-        kwargs={"queue": "tracking_queue"},
+    # queue is an apply_async option, NOT a task keyword argument
+    update_container_tracking.apply_async(
+        args=[container_id, current_user.tenant_id], queue="tracking_queue"
     )
     return {"message": "Tracking update queued", "container_id": container_id}
 

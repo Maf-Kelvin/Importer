@@ -128,7 +128,10 @@ async def mark_item_sold(
     current_user: ClerkUser,
 ):
     svc  = ContainerService(db)
-    item = await svc.mark_item_sold(item_id, data, current_user)
+    try:
+        item = await svc.mark_item_sold(item_id, data, current_user)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     if not item:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

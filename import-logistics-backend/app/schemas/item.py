@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.item import ItemCategory, ItemCondition
+from app.schemas.types import Money, PositiveMoney, Rate, Weight
 
 # Break circular import — PriceRecordInDB only imported for type hints
 if TYPE_CHECKING:
@@ -22,11 +23,11 @@ class ItemBase(BaseModel):
     description:       Optional[str]       = None
     category:          ItemCategory
     condition:         ItemCondition
-    purchase_price:    float               = Field(..., gt=0)
+    purchase_price:    PositiveMoney
     purchase_currency: str                 = Field(..., min_length=3, max_length=3)
     purchase_date:     Optional[date]      = None   # fixed: was Optional[str]
-    weight:            float               = Field(..., gt=0, description="Weight in kg")
-    volume:            Optional[float]     = Field(None, gt=0, description="Volume in m³")
+    weight:            Weight              # kg, up to 3 decimal places
+    volume:            Optional[Weight]    = None   # m³, up to 3 decimal places
 
 
 class ItemCreate(ItemBase):
@@ -38,17 +39,17 @@ class ItemUpdate(BaseModel):
     description:       Optional[str]          = None
     category:          Optional[ItemCategory] = None
     condition:         Optional[ItemCondition] = None
-    purchase_price:    Optional[float]        = Field(None, gt=0)
+    purchase_price:    Optional[PositiveMoney] = None
     purchase_currency: Optional[str]          = Field(None, min_length=3, max_length=3)
     purchase_date:     Optional[date]         = None
-    weight:            Optional[float]        = Field(None, gt=0)
-    volume:            Optional[float]        = Field(None, gt=0)
-    selling_price:     Optional[float]        = Field(None, gt=0)
+    weight:            Optional[Weight]       = None
+    volume:            Optional[Weight]       = None
+    selling_price:     Optional[PositiveMoney] = None
 
 
 class MarkSoldRequest(BaseModel):
     """Request body for POST /items/{id}/mark-sold — not a query param."""
-    selling_price: float = Field(..., gt=0)
+    selling_price: PositiveMoney
     sold_date:     Optional[date] = None
     customer_id:   Optional[int]  = None
     notes:         Optional[str]  = None
@@ -57,12 +58,12 @@ class MarkSoldRequest(BaseModel):
 class ItemInDB(ItemBase):
     id:                 int
     tenant_id:          int
-    fx_rate_to_usd:     float
-    purchase_price_usd: float
-    allocated_cost:     float
-    landed_cost:        float
-    recommended_price:  Optional[float] = None
-    selling_price:      Optional[float] = None
+    fx_rate_to_usd:     Rate
+    purchase_price_usd: Money
+    allocated_cost:     Money
+    landed_cost:        Money
+    recommended_price:  Optional[Money] = None
+    selling_price:      Optional[Money] = None
     sold:               bool
     sold_date:          Optional[date]  = None   # fixed: was Optional[str]
     created_at:         datetime

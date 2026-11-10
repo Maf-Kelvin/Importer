@@ -1,6 +1,7 @@
 # app/models/expense.py
 import enum
-from sqlalchemy import Float, ForeignKey, Index, Integer, String, Text, Enum as SQLEnum
+from decimal import Decimal
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, Numeric, String, Text, Enum as SQLEnum
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from app.models.base import BaseModel
 
@@ -28,13 +29,13 @@ class ContainerExpense(BaseModel):
     )
 
     expense_type: Mapped[ExpenseType] = mapped_column(SQLEnum(ExpenseType), nullable=False)
-    amount:       Mapped[float]       = mapped_column(Float, nullable=False)
+    amount:       Mapped[Decimal]     = mapped_column(Numeric(18, 4), nullable=False)
     currency:     Mapped[str]         = mapped_column(String(3), nullable=False, default="USD")
     description:  Mapped[str|None]    = mapped_column(Text, nullable=True)
 
     # FX tracking
-    fx_rate_to_usd: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
-    amount_usd:     Mapped[float] = mapped_column(Float, nullable=False)
+    fx_rate_to_usd: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("1"))
+    amount_usd:     Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
 
     # Relationships
     container: Mapped["Container"] = relationship("Container", back_populates="expenses")
@@ -42,6 +43,8 @@ class ContainerExpense(BaseModel):
     __table_args__ = (
         Index("ix_expense_container_id", "container_id"),
         Index("ix_expense_tenant_id",    "tenant_id"),
+        CheckConstraint("amount > 0", name="ck_expense_amount_positive"),
+        CheckConstraint("amount_usd >= 0", name="ck_expense_amount_usd_nonneg"),
     )
 
     def __repr__(self) -> str:

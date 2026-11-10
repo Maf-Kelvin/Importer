@@ -4,9 +4,14 @@ version: "3.9"
 
 x-common-env: &common-env
   DATABASE_URL:          postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
-  REDIS_URL:             redis://redis:6379/0
-  CELERY_BROKER_URL:     redis://redis:6379/0
-  CELERY_RESULT_BACKEND: redis://redis:6379/0
+  # "state" Redis: broker, locks, idempotency keys, token blacklist (noeviction)
+  REDIS_URL:             redis://:${REDIS_PASSWORD}@redis:6379/0
+  CELERY_BROKER_URL:     redis://:${REDIS_PASSWORD}@redis:6379/0
+  CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+  # disposable cache Redis (dashboards, FX): evicts old keys under memory pressure
+  CACHE_REDIS_URL:       redis://:${REDIS_PASSWORD}@redis-cache:6379/0
+  DATABASE_PGBOUNCER:    "true"
+  TRUST_PROXY_HEADERS:   "true"   # Nginx sets X-Real-IP; the API is not exposed directly
   ENVIRONMENT:           production
   DEBUG:                 "false"
   SECRET_KEY:            ${SECRET_KEY:?SECRET_KEY must be set}
@@ -49,6 +54,8 @@ services:
         condition: service_healthy
 
   # ── Redis ──────────────────────────────────────────────────────────
+  # State Redis: NEVER evicts. If it fills up, writes fail loudly instead of
+  # silently deleting locks, idempotency keys, revoked tokens or queued tasks.
   redis:
     image: redis:7-alpine
     restart: always
@@ -56,10 +63,28 @@ services:
       redis-server
       --requirepass ${REDIS_PASSWORD:?required}
       --appendonly yes
+      --appendfsync everysec
       --maxmemory 512mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
+    healthcheck:
+      test:     ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout:  3s
+      retries:  3
+
+  # Cache Redis: disposable. Losing it only costs a few extra DB queries.
+  redis-cache:
+    image: redis:7-alpine
+    restart: always
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?required}
+      --save ""
+      --appendonly no
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
     healthcheck:
       test:     ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
@@ -69,8 +94,8 @@ services:
   # ── Nginx reverse proxy ────────────────────────────────────────────
   nginx:
     build:
-      context:    ..
-      dockerfile: docker/nginx/Dockerfile
+      context:    ../..       # the repository root: the image builds the frontend AND bundles nginx.conf
+      dockerfile: import-logistics-backend/docker/nginx/Dockerfile
     restart: always
     ports:
       - "80:80"
@@ -78,11 +103,26 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/ssl:/etc/nginx/ssl:ro       # mount your SSL certs here
-      - ../uploads:/app/uploads:ro
     depends_on:
       - web
 
   # ── FastAPI — Gunicorn + Uvicorn workers ──────────────────────────
+  # ── One-shot schema migration (runs before the app starts) ─────────
+  migrate:
+    build:
+      context:    ..
+      dockerfile: docker/Dockerfile
+      target:     production
+    restart: "no"
+    environment:
+      <<: *common-env
+      ALEMBIC_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: alembic upgrade head
+
+  # ── FastAPI application ────────────────────────────────────────────
   web:
     build:
       context:    ..
@@ -92,6 +132,8 @@ services:
     environment:
       <<: *common-env
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       pgbouncer:
         condition: service_started
       redis:
@@ -160,7 +202,7 @@ services:
       - redis
     command: >
       celery -A app.core.celery_app worker
-      --queues=fx_queue,notification_queue
+      --queues=fx_queue,notification_queue,default
       --loglevel=warning
       --concurrency=2
       --hostname=worker-fx-notify@%h

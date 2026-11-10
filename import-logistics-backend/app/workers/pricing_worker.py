@@ -20,13 +20,13 @@ def _run(coro):
     default_retry_delay=180,   # 3 min — scraping sites may be temporarily slow
     queue="scraping_queue",
 )
-def fetch_market_prices(self, item_id: int, user_id: int):
+def fetch_market_prices(self, item_id: int, user_id: int, tenant_id: int | None = None):
     """
     Scrape market prices for an item from all configured sources
     and persist each result as a PriceRecord.
     """
     try:
-        return _run(_do_fetch_market_prices(self, item_id, user_id))
+        return _run(_do_fetch_market_prices(self, item_id, user_id, tenant_id))
     except Exception as exc:
         logger.error(
             "fetch_market_prices failed item_id=%d: %s", item_id, exc, exc_info=True
@@ -34,7 +34,7 @@ def fetch_market_prices(self, item_id: int, user_id: int):
         raise self.retry(exc=exc)
 
 
-async def _do_fetch_market_prices(task, item_id: int, user_id: int) -> dict:
+async def _do_fetch_market_prices(task, item_id: int, user_id: int, tenant_id: int | None = None) -> dict:
     from app.core.database import AsyncSessionLocal
     from app.models.item import Item
     from app.services.pricing_service import PricingService
@@ -46,10 +46,12 @@ async def _do_fetch_market_prices(task, item_id: int, user_id: int) -> dict:
 
     async with AsyncSessionLocal() as db:
         # Load item for name + category
-        item_result = await db.execute(select(Item).where(Item.id == item_id))
-        item = item_result.scalar_one_or_none()
+        q = select(Item).where(Item.id == item_id, Item.deleted_at.is_(None))
+        if tenant_id is not None:
+            q = q.where(Item.tenant_id == tenant_id)
+        item = (await db.execute(q)).scalar_one_or_none()
         if not item:
-            logger.warning("fetch_market_prices: item_id=%d not found", item_id)
+            logger.warning("fetch_market_prices: item_id=%d not found for tenant", item_id)
             return {"status": "error", "message": "Item not found"}
 
         pricing_svc = PricingService(db)
@@ -181,12 +183,12 @@ async def _do_refresh_demand_analytics() -> dict:
                 sold_90d   = [i for i in sold_items if i.sold_date and i.sold_date >= d90]
 
                 avg_sale = (
-                    sum(i.selling_price for i in sold_items) / len(sold_items)
+                    float(sum(i.selling_price for i in sold_items)) / len(sold_items)
                     if sold_items else None
                 )
                 avg_margin = (
                     sum(
-                        (i.selling_price - i.landed_cost) / i.landed_cost
+                        float((i.selling_price - i.landed_cost) / i.landed_cost)
                         for i in sold_items if i.landed_cost
                     ) / len(sold_items)
                     if sold_items else None

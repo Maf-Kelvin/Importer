@@ -1,9 +1,10 @@
 # app/models/item.py
 import enum
 from datetime import date
+from decimal import Decimal
 from sqlalchemy import (
-    Boolean, Date, Float, ForeignKey, Index, Integer,
-    String, Text, Enum as SQLEnum,
+    Boolean, CheckConstraint, Date, ForeignKey, Index, Integer,
+    Numeric, String, Text, Enum as SQLEnum,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
@@ -46,25 +47,25 @@ class Item(SoftDeleteModel):
     condition:   Mapped[ItemCondition] = mapped_column(SQLEnum(ItemCondition), nullable=False)
 
     # Purchase — date stored as proper Date column, not String
-    purchase_price:    Mapped[float]    = mapped_column(Float, nullable=False)
+    purchase_price:    Mapped[Decimal]  = mapped_column(Numeric(18, 4), nullable=False)
     purchase_currency: Mapped[str]      = mapped_column(String(3), nullable=False)
     purchase_date:     Mapped[date|None] = mapped_column(Date, nullable=True)   # fixed: was String
 
     # FX
-    fx_rate_to_usd:    Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
-    purchase_price_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    fx_rate_to_usd:    Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("1"))
+    purchase_price_usd: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
 
     # Physical
-    weight: Mapped[float]      = mapped_column(Float, nullable=False)
-    volume: Mapped[float|None] = mapped_column(Float, nullable=True)
+    weight: Mapped[Decimal]      = mapped_column(Numeric(12, 3), nullable=False)
+    volume: Mapped[Decimal|None] = mapped_column(Numeric(12, 3), nullable=True)
 
     # Cost allocation
-    allocated_cost: Mapped[float] = mapped_column(Float, default=0.0)
-    landed_cost:    Mapped[float] = mapped_column(Float, default=0.0)
+    allocated_cost: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False, default=Decimal("0"))
+    landed_cost:    Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False, default=Decimal("0"))
 
     # Pricing
-    recommended_price: Mapped[float|None] = mapped_column(Float, nullable=True)
-    selling_price:     Mapped[float|None] = mapped_column(Float, nullable=True)
+    recommended_price: Mapped[Decimal|None] = mapped_column(Numeric(18, 4), nullable=True)
+    selling_price:     Mapped[Decimal|None] = mapped_column(Numeric(18, 4), nullable=True)
     sold:              Mapped[bool]        = mapped_column(Boolean, default=False)
     sold_date:         Mapped[date|None]   = mapped_column(Date, nullable=True)   # fixed: was String
 
@@ -85,6 +86,8 @@ class Item(SoftDeleteModel):
         Index("ix_item_tenant_category",  "tenant_id", "category"),
         Index("ix_item_tenant_sold",      "tenant_id", "sold"),
         Index("ix_item_container_id",     "container_id"),
+        CheckConstraint("purchase_price > 0", name="ck_item_price_positive"),
+        CheckConstraint("weight > 0", name="ck_item_weight_positive"),
     )
 
     def __repr__(self) -> str:

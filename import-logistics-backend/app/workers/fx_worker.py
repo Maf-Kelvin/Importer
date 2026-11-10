@@ -56,7 +56,7 @@ async def _do_update_fx_rates() -> dict:
                 continue
             try:
                 rate = await fx.get_fx_rate(currency, "USD")
-                results[f"{currency}_USD"] = rate
+                results[f"{currency}_USD"] = float(rate)
 
                 # Persist to history table (upsert pattern)
                 async with transaction(db):

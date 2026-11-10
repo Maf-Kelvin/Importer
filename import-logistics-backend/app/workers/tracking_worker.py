@@ -19,10 +19,10 @@ def _run(coro):
     default_retry_delay=60,
     queue="tracking_queue",
 )
-def update_container_tracking(self, container_id: int):
-    """Update tracking for a single container."""
+def update_container_tracking(self, container_id: int, tenant_id: int | None = None):
+    """Update tracking for a single container (tenant_id guards against cross-tenant calls)."""
     try:
-        return _run(_do_update_container_tracking(container_id))
+        return _run(_do_update_container_tracking(container_id, tenant_id))
     except Exception as exc:
         logger.error(
             "Tracking update failed for container_id=%d: %s",
@@ -31,13 +31,13 @@ def update_container_tracking(self, container_id: int):
         raise self.retry(exc=exc)
 
 
-async def _do_update_container_tracking(container_id: int) -> dict:
+async def _do_update_container_tracking(container_id: int, tenant_id: int | None = None) -> dict:
     from app.core.database import AsyncSessionLocal
     from app.services.tracking_service import TrackingService
 
     async with AsyncSessionLocal() as db:
         svc = TrackingService(db)
-        return await svc.update_container_tracking(container_id)
+        return await svc.update_container_tracking(container_id, tenant_id)
 
 
 @celery_app.task(

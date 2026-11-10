@@ -24,11 +24,12 @@ class TrackingService:
     # Update tracking for one container
     # ------------------------------------------------------------------
     async def update_container_tracking(
-        self, container_id: int
+        self, container_id: int, tenant_id: Optional[int] = None
     ) -> dict[str, Any]:
-        result = await self.db.execute(
-            select(Container).where(Container.id == container_id)
-        )
+        q = select(Container).where(Container.id == container_id)
+        if tenant_id is not None:           # manual requests are always tenant-scoped
+            q = q.where(Container.tenant_id == tenant_id)
+        result = await self.db.execute(q)
         container = result.scalar_one_or_none()
         if not container or not container.msc_container_number:
             return {"error": "Container not found or MSC number not set"}
@@ -180,6 +181,10 @@ class TrackingService:
         self, msc_number: str
     ) -> Optional[dict[str, Any]]:
         if not settings.MSC_API_KEY:
+            if settings.ENVIRONMENT == "production":
+                logger.error("MSC_API_KEY is not set: tracking is unavailable")
+                return None
+            logger.warning("MSC_API_KEY not set: returning MOCK tracking data (non-production)")
             return self._mock_tracking_data()
 
         try:

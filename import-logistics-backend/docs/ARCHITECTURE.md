@@ -1,351 +1,155 @@
 # System Architecture
 
-## Overview
+## 1. Overview
 
-The Import Profit & Logistics Intelligence System follows a layered clean architecture with clear separation between API routing, business logic, data access, and background processing. It is designed as a multi-tenant SaaS platform with horizontal scaling in mind.
+A multi-tenant, containerised backend. A Flutter client calls a versioned REST API.
+The API holds no state; everything durable is in PostgreSQL, everything slow runs in
+Celery workers, and two Redis instances with different jobs keep critical state apart
+from disposable cache.
 
----
+```mermaid
+flowchart TD
+    Client["Flutter client"] --> Nginx["Nginx<br/>TLS, rate limits"]
+    Nginx --> API
 
-## Full System Architecture
+    subgraph API["FastAPI app (Gunicorn + Uvicorn workers)"]
+        direction LR
+        MW["Middleware<br/>CORS, logging, metrics,<br/>idempotency"] --> RT["Routers<br/>thin REST routes"] --> SV["Services<br/>business logic"]
+    end
 
-```
-                        ┌─────────────────────────────┐
-                        │   Clients                   │
-                        │   Flutter Mobile / Desktop  │
-                        │   Flutter Web               │
-                        └────────────┬────────────────┘
-                                     │ HTTPS
-                        ┌────────────▼────────────────┐
-                        │   Nginx Reverse Proxy        │
-                        │   SSL termination            │
-                        │   Gzip compression           │
-                        │   Rate limiting zones        │
-                        │   Security headers           │
-                        └────────────┬────────────────┘
-                                     │ HTTP/2
-                        ┌────────────▼────────────────┐
-                        │   FastAPI Application        │
-                        │   Gunicorn + UvicornWorker   │
-                        │   (2 × CPU + 1 workers)      │
-                        └──┬──────────┬───────────────┘
-                           │          │
-          ┌────────────────▼──┐   ┌───▼────────────────┐
-          │   PgBouncer        │   │   Redis 7           │
-          │   Connection pool  │   │   Cache             │
-          │   transaction mode │   │   Celery broker     │
-          └────────┬───────────┘   │   Token blacklist   │
-                   │               │   Idempotency keys  │
-          ┌────────▼───────────┐   │   Rate limit state  │
-          │   PostgreSQL 16     │   │   Distributed locks │
-          │   Primary (writes)  │   └───────┬────────────┘
-          │   35+ tables        │           │
-          └────────────────────┘   ┌────────▼────────────┐
-                                   │   Celery Workers     │
-                                   │   worker-tracking    │
-                                   │   worker-pricing     │
-                                   │   worker-fx-notify   │
-                                   │   celery-beat        │
-                                   └──────────────────────┘
+    SV --> PGB["PgBouncer<br/>transaction pooling"] --> PG[("PostgreSQL 16<br/>tenant_id on every table")]
+    SV --> RS[("Redis STATE<br/>noeviction + AOF<br/>locks, idempotency,<br/>token blacklist, broker")]
+    SV --> RC[("Redis CACHE<br/>allkeys-lru<br/>dashboards, FX")]
 
-External Services
-├── MSC Container Tracking API
-├── ExchangeRate API (FX rates)
-├── Jiji / eBay / Mobile.de / AutoScout24 / Bazos.cz (scraping)
-├── SMTP / SendGrid / Mailgun / SES (email)
-└── AWS S3 / Cloudflare R2 (file storage)
+    RS --> CW["Celery workers<br/>fx, tracking, pricing,<br/>scraping, notification"]
+    Beat["Celery beat<br/>schedules"] --> RS
+    CW --> PGB
+    CW --> EXT["External APIs<br/>carrier tracking, FX, email"]
 
-Monitoring Stack
-├── Prometheus (metrics scraping)
-├── Grafana (dashboards)
-├── Sentry (error tracking)
-├── Flower (Celery task monitoring)
-└── OpenTelemetry (distributed tracing)
+    Migrate["migrate (one-shot)<br/>alembic upgrade head"] -.-> PG
+    API -.-> Mon["Prometheus, Sentry, OpenTelemetry"]
 ```
 
----
+## 2. Layers and responsibilities
 
-## Backend Internal Architecture
+| Layer | Responsibility | Rule |
+|-------|----------------|------|
+| Nginx | TLS, request-size and rate limits (login 5/min, tracking 20/min, API 100/min) | The API is never exposed directly |
+| Middleware | CORS (outermost), request ID + structured logs, Prometheus metrics, idempotency (innermost) | Starlette wraps in reverse: the last middleware added is the outermost |
+| Routers | Parse and validate input (Pydantic), authenticate, authorise by role, map errors to HTTP | No business logic |
+| Services | Business rules, transactions, tenant checks, calls to external systems | The only layer that touches the database |
+| Models / schemas | SQLAlchemy tables; Pydantic request and response types | Money is Decimal everywhere |
+| Workers | Slow and scheduled work: FX refresh, tracking, scraping, pricing, notifications | One queue per workload |
 
-The backend follows a strict layered architecture. No layer reaches past its immediate neighbour.
+## 3. Request flow (example: add an expense)
 
-```
-HTTP Request
-     │
-     ▼
-┌──────────────────────────────────┐
-│  Middleware Layer                 │
-│  CORS → Logging → Metrics        │
-│  → Idempotency                   │
-└──────────────┬───────────────────┘
-               │
-               ▼
-┌──────────────────────────────────┐
-│  Router Layer  (app/routers/)    │
-│  Request validation              │
-│  Rate limiting                   │
-│  Authentication (deps.py)        │
-│  Role enforcement                │
-└──────────────┬───────────────────┘
-               │
-               ▼
-┌──────────────────────────────────┐
-│  Service Layer  (app/services/)  │
-│  Business logic                  │
-│  Ownership checks                │
-│  Tenant isolation                │
-│  Transaction management          │
-└──────────────┬───────────────────┘
-               │
-               ▼
-┌──────────────────────────────────┐
-│  Model Layer  (app/models/)      │
-│  SQLAlchemy ORM                  │
-│  Async queries                   │
-│  Relationship loading            │
-└──────────────┬───────────────────┘
-               │
-               ▼
-┌──────────────────────────────────┐
-│  Database  (PostgreSQL)          │
-│  via PgBouncer                   │
-└──────────────────────────────────┘
-```
+1. Nginx applies rate limits and forwards to a Gunicorn worker.
+2. Middleware stack: CORS, request ID/logging, metrics, then idempotency (reads the body, claims the `Idempotency-Key`).
+3. The router validates the body (`PositiveMoney`, 4 decimal places max) and the dependency authenticates the JWT (blacklist check in state Redis, then user lookup) and checks the role.
+4. `ContainerService` verifies the container belongs to the caller's tenant (clerks: only their own), fetches the FX rate **before** opening a transaction, then writes the expense in one transaction.
+5. The response is returned; the idempotency middleware stores a 2xx response so a retry replays it.
 
----
-
-## Worker Architecture
-
-Celery workers are separated by concern into dedicated queues. This prevents a flood of scraping jobs from starving time-sensitive tracking updates.
+## 4. Background work
 
 ```
-Celery Beat (scheduler)
-     │
-     ├── fx_queue          (every 1h)  ──▶  worker-fx-notify
-     ├── tracking_queue    (every 1h)  ──▶  worker-tracking
-     ├── notification_queue (every 1h) ──▶  worker-fx-notify
-     └── pricing_queue     (every 6h)  ──▶  worker-pricing
-
-On-demand tasks (triggered by API):
-     ├── scraping_queue   ──▶  worker-pricing
-     ├── tracking_queue   ──▶  worker-tracking
-     └── notification_queue ──▶ worker-fx-notify
-
-Queue assignment:
-┌─────────────────────┬────────────────────────────────────┐
-│ Queue               │ Tasks                              │
-├─────────────────────┼────────────────────────────────────┤
-│ tracking_queue      │ update_container_tracking          │
-│                     │ update_all_tracking                │
-├─────────────────────┼────────────────────────────────────┤
-│ scraping_queue      │ fetch_market_prices                │
-├─────────────────────┼────────────────────────────────────┤
-│ pricing_queue       │ update_item_pricing                │
-│                     │ refresh_demand_analytics           │
-├─────────────────────┼────────────────────────────────────┤
-│ fx_queue            │ update_fx_rates                    │
-├─────────────────────┼────────────────────────────────────┤
-│ notification_queue  │ send_tracking_notifications        │
-│                     │ send_custom_notification           │
-│                     │ notify_low_stock                   │
-└─────────────────────┴────────────────────────────────────┘
-
-Reliability features:
-- task_acks_late=True          Task only acknowledged after completion
-- task_reject_on_worker_lost   Re-queued if worker dies mid-task
-- max_retries=3                Automatic retry with backoff
-- Distributed Redis locks      Prevent duplicate periodic tasks
+Celery beat --(hourly)--> fx_queue / tracking_queue / notification_queue   (state Redis broker)
+                          analytics every 6 hours
+worker --> distributed lock (so overlapping runs cannot collide)
+       --> service call (external API or database)
+       --> result persisted in PostgreSQL
 ```
 
----
+* Queues: `fx_queue`, `tracking_queue`, `pricing_queue`, `scraping_queue`, `notification_queue`, default.
+  Slow scraping cannot delay tracking.
+* `acks_late` + `reject_on_worker_lost` + prefetch 1: a crashed worker's task is redelivered, so tasks must be safe to repeat.
+* Locks use `SET NX EX` and a Lua compare-and-delete release, so a worker never frees a lock it no longer owns.
 
-## Authentication & Security Architecture
-
-```
-Login Request
-     │
-     ▼
-Account lockout check (Redis)
-     │
-     ▼
-Password verification (bcrypt)
-     │
-     ▼
-Issue access token (15min–24h)  +  refresh token (30 days)
-     │                                    │
-     ▼                                    ▼
-Stored client-side                Stored client-side
-Used for API calls                Used to rotate access token
-     │
-     ▼
-Every API request:
-  1. Extract Bearer token
-  2. Check Redis blacklist (O(1) lookup)
-  3. Decode + verify JWT signature
-  4. Verify token type = "access"
-  5. Load user from DB
-  6. Check is_active
-  7. Enforce role-based access
-
-Logout:
-  - Blacklist access token (TTL = remaining expiry)
-  - Blacklist refresh token (TTL = remaining expiry)
-  - Tokens expire naturally — no cleanup job needed
-
-Token rotation:
-  - Each /auth/refresh call issues new access + refresh tokens
-  - Old refresh token is immediately blacklisted
-```
-
----
-
-## Multi-Tenancy Architecture
-
-Every table in the database includes a `tenant_id` foreign key to `organizations`. Data isolation is enforced at the service layer on every query.
+## 5. Data model (simplified)
 
 ```
-organizations (tenants)
-     │
-     ├── users          (tenant_id)
-     ├── containers     (tenant_id)
-     ├── items          (tenant_id)
-     ├── expenses       (tenant_id)
-     ├── price_records  (tenant_id)
-     ├── tracking       (tenant_id)
-     ├── warehouses     (tenant_id)
-     ├── customers      (tenant_id)
-     ├── orders         (tenant_id)
-     ├── payments       (tenant_id)
-     ├── sales          (tenant_id)
-     ├── notifications  (tenant_id)
-     ├── audit_logs     (tenant_id)
-     └── demand_analytics (tenant_id)
-
-Isolation rule:
-  Every service method filters by current_user.tenant_id.
-  A user from tenant A can never read or write tenant B's data.
+Organization (tenant) 1--* User
+                      1--* Container 1--* Item        (soft delete)
+                                     1--* ContainerExpense
+                                     1--* TrackingRecord
+Item 1--* PriceRecord        Item 1--0..1 Sale
 ```
 
----
+* `tenant_id` on every business table with composite indexes such as `(tenant_id, owner_id)`.
+* The carrier container number is unique **per tenant**, not globally.
+* Check constraints: expense amount > 0, item price > 0, item weight > 0.
+* Money `NUMERIC(18,4)`, FX rate `NUMERIC(18,8)`, weight/volume `NUMERIC(12,3)`.
 
-## Data Flow: Container Import Lifecycle
+## 6. Redis: two roles, never mixed
 
-```
-1. Create Container
-   POST /containers/
-        │
-        ▼
-2. Add Items
-   POST /items/  (×N)
-        │
-        ▼
-3. Add Expenses
-   POST /expenses/  (loading, shipping, clearing...)
-        │
-        ▼
-4. Seal Container
-   POST /containers/{id}/seal
-        │
-        ▼
-5. Allocate Costs
-   POST /containers/{id}/allocate-costs
-        │  Each item.allocated_cost and item.landed_cost calculated
-        ▼
-6. Generate Pricing
-   POST /pricing/generate/{item_id}
-        │  cost_based_price = landed_cost × (1 + margin)
-        │  market_prices = from scraper results
-        │  recommended_price = weighted average
-        ▼
-7. Track Shipment
-   Celery beat → update_all_tracking (every 1h)
-        │  MSC API → TrackingRecord created
-        │  Email notification → owner
-        ▼
-8. Mark Items Sold
-   POST /items/{id}/mark-sold
-        │  Item.sold = true
-        │  Sale record created
-        │  Profit calculated
-        ▼
-9. View Reports
-   GET /reports/profit/containers
-   GET /reports/profit/categories
-   GET /reports/dashboard  (Redis-cached 5min)
-```
+| Instance | Holds | Policy | Why |
+|----------|-------|--------|-----|
+| **State** (`REDIS_URL`) | Celery broker and results, locks, idempotency records, token blacklist, login-lockout counters | `noeviction`, AOF persistence, password | Evicting any of these silently breaks correctness or security |
+| **Cache** (`CACHE_REDIS_URL`) | Dashboard summaries, FX rates | `allkeys-lru`, no persistence | Losing it only costs extra queries |
 
----
+Clients are shared per event loop (`app/core/redis_clients.py`) instead of opening a connection per call.
 
-## Caching Architecture
+## 7. Idempotency design
+
+State machine in `app/core/idempotency.py`, glue in `app/middleware/idempotency_middleware.py`:
 
 ```
-Redis Cache Layers:
-
-┌─────────────────────────────────────────────┐
-│ Key pattern              │ TTL   │ Invalidated by        │
-├──────────────────────────┼───────┼───────────────────────┤
-│ dashboard:{t}:{u}        │ 5 min │ Item sold / container │
-│ fx_rate:{from}:{to}      │ 1 hr  │ fx_worker update      │
-│ pricing:{item_id}        │ 30min │ New price record       │
-│ idempotency:{u}:{key}    │ 24 hr │ Never (TTL only)       │
-│ bl:{token}               │ Token │ Never (TTL only)       │
-│                          │ TTL   │                       │
-│ login_fail:{username}    │ 15min │ Successful login       │
-│ lock:{name}              │ Task  │ Task completion        │
-│                          │ TTL   │                       │
-└─────────────────────────────────────────────┘
+claim (SET NX) --won--> run endpoint --2xx--> complete (store response, 24h)
+      |                          \--other / exception--> release (client may retry)
+      \--lost--> same fingerprint & completed  -> replay
+                 same fingerprint & running    -> 409
+                 different fingerprint         -> 422
 ```
 
----
+* Key = tenant + user (from the **verified** JWT) + hash of the client key; the request fingerprint is a SHA-256 of method, path, query and body.
+* Completion and release are Lua scripts that check ownership, so a slow request cannot overwrite a newer one after its claim expired.
+* **Durable by default:** the store is PostgreSQL (`idempotency_keys`, UNIQUE on `key`). The claim is `INSERT ... ON CONFLICT DO NOTHING`, committed before the endpoint runs, so exactly one concurrent request wins and a Redis flush or restart cannot let a duplicate through. Expired claims (a crashed request) can be taken over; a nightly Celery task purges old rows. Set `IDEMPOTENCY_BACKEND=redis` for the faster, less durable variant.
+* **Remaining window (honest):** the idempotency record is completed after the endpoint commits. If the process dies in between, the claim expires after `IDEMPOTENCY_LOCK_TTL` and a retry would run again. Closing that fully needs the record written inside the business transaction, or a natural unique key on the business row (for example a unique provider reference on a payment).
 
-## File Storage Architecture
+## 8. Money handling
 
-```
-Upload request
-     │
-     ▼
-MIME type validation (python-magic — reads bytes, not extension)
-     │
-     ▼
-File size check (max 10 MB)
-     │
-     ▼
-Generate safe key: {uploader_id}/{uuid}.{ext}
-     │
-     ▼
-Storage backend (config-driven):
-  ├── local  →  /app/uploads/{key}
-  ├── s3     →  s3://{bucket}/{key}
-  └── r2     →  r2://{bucket}/{key}  (Cloudflare R2, S3-compatible API)
-```
+`app/utils/money.py` is the single place for money rules:
+`to_decimal` (floats go through `str`), `quantize` (banker's rounding), `convert` (amount x rate),
+and `allocate_proportionally` (largest remainder: parts always sum to the total).
+Cost allocation locks the container row, runs in one transaction, and checks the invariant before commit.
+Reports use one definition everywhere: revenue and cost of goods sold count SOLD items only, profit = revenue - cost of goods sold, and unsold stock is shown separately as inventory value (it used to be subtracted as if lost). Expenses and items are aggregated separately before joining, so totals are not multiplied. FX rates are cached for one hour; if no rate can be obtained, production fails with 503 instead of using a stale hard-coded number.
 
----
+## 9. Security
 
-## Deployment Architecture
+* JWT access and refresh tokens, refresh rotation, logout blacklist (stores a hash, not the token).
+* Roles: admin, manager, clerk, viewer. Services filter by `tenant_id`; the allocation integration test checks cross-tenant access, and broader tenant-isolation tests are still to be written.
+* Login lockout (Redis counters) plus Nginx and application rate limits.
+* Production start-up validation: strong `SECRET_KEY`, no default database credentials, `DEBUG=false`.
+* Sentry with `send_default_pii=false`; readiness errors are logged, never returned to callers.
+* Uploads: size limit and MIME-type allow-list.
 
-```
-Development:
-  docker-compose.yml
-  └── db + pgbouncer + redis + web(uvicorn reload)
-      + worker-tracking + worker-pricing + worker-fx-notify
-      + celery-beat + flower + prometheus + grafana
+## 9a. Audit trail and tenant onboarding
 
-Production:
-  docker-compose.prod.yml
-  └── nginx (SSL, rate limiting)
-      └── web × 2 (gunicorn + uvicornworker)
-          ├── pgbouncer → db (no exposed port)
-          ├── redis (password protected, no exposed port)
-          ├── worker-tracking × 1 (concurrency=4)
-          ├── worker-pricing × 1 (concurrency=2)
-          ├── worker-fx-notify × 1 (concurrency=2)
-          ├── celery-beat × 1
-          ├── flower (basic auth, internal only)
-          ├── prometheus (internal only)
-          └── grafana (internal only)
+* `audit_logs` records who did what to which record: action, entity, before/after values (Decimals as exact strings), client IP and user agent.
+  `AuditService.add()` stages the row in the **same transaction** as the change, so the two commit or roll back together.
+  Client IP comes from `X-Real-IP` only when `TRUST_PROXY_HEADERS=true` (behind Nginx), so it cannot be forged.
+* Organisations are created by a platform administrator (`POST /organizations/`), which creates the tenant and its first admin atomically.
+  There is no public sign-up. User-management endpoints are scoped to the caller's own tenant.
 
-Future scaling path:
-  Kubernetes + Horizontal Pod Autoscaler
-  ├── web deployment (scale by CPU/request rate)
-  ├── worker deployments (scale by queue depth)
-  └── Read replica for reporting queries
-```
+## 9b. Pricing and authorisation
+
+* Price recommendations come from a robust, explainable engine (`app/utils/pricing_math.py`, see `PRICING.md`): USD-normalised comparables, outlier removal, recency and source weights, blended with cost-plus by a trust score, with a minimum-margin floor.
+* Every endpoint that takes a record id resolves it through a tenant-scoped (and for clerks, owner-scoped) lookup **before** doing work or enqueueing a job; background jobs receive the tenant id and re-check it. Uploaded files are stored under `<tenant>/<user>/<random>`, validated against a strict key pattern, and served only through an authenticated endpoint.
+
+## 10. Observability
+
+JSON logs with request ID in production, Prometheus metrics at `/metrics`, Sentry, optional OpenTelemetry,
+`/health` (liveness) and `/ready` (database + migrated schema + state Redis; cache and Celery are reported but non-fatal).
+
+## 11. Deployment
+
+`docker/docker-compose.prod.yml`: `db`, `pgbouncer`, `redis` (state), `redis-cache`, `migrate` (one-shot),
+`web` (2 replicas), per-queue Celery workers, `beat`, `nginx`, `flower`, `prometheus`, `grafana`.
+The API starts only after `migrate` completes successfully.
+
+## 12. Known limitations and next steps
+
+* Market prices are scraped estimates; see `PRICING.md` for the engine's limits.
+* Carrier tracking has only been exercised with mock data.
+* Write the idempotency record inside the business transaction for payment-like operations (see section 7).
+* Add row-level security in PostgreSQL as a second tenant-isolation layer.
+* Pricing recommendations are returned as floats (they are estimates); stored prices and all report amounts are Decimal.

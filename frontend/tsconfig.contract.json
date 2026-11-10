@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/api/generated", "src/api/contract.ts", "src/api/types.ts"]
+}

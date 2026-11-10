@@ -2,7 +2,7 @@
 import enum
 from sqlalchemy import (
     Boolean, ForeignKey, Index, Integer,
-    String, Text, Enum as SQLEnum,
+    String, Text, UniqueConstraint, Enum as SQLEnum,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
@@ -31,7 +31,7 @@ class Container(SoftDeleteModel):
     # Identity
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     container_type: Mapped[ContainerType] = mapped_column(SQLEnum(ContainerType), nullable=False)
-    msc_container_number: Mapped[str | None] = mapped_column(String(50), unique=True, index=True)
+    msc_container_number: Mapped[str | None] = mapped_column(String(50), index=True)
 
     # Allocation
     allocation_method: Mapped[AllocationMethod] = mapped_column(
@@ -73,6 +73,8 @@ class Container(SoftDeleteModel):
     __table_args__ = (
         Index("ix_container_tenant_owner", "tenant_id", "owner_id"),
         Index("ix_container_tenant_shipped", "tenant_id", "is_shipped"),
+        # unique per tenant: one tenant must not be able to block (or probe) another
+        UniqueConstraint("tenant_id", "msc_container_number", name="uq_container_tenant_msc_number"),
     )
 
     def __repr__(self) -> str:

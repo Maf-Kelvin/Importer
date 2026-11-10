@@ -1,0 +1,13 @@
+# Keeps the build context small and free of secrets
+.git
+**/node_modules
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/.env
+frontend/dist
+frontend/playwright-report
+frontend/test-results
+import-logistics-backend/uploads
+import-logistics-backend/docker/nginx/ssl/*.pem

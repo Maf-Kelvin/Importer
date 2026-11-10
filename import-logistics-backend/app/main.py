@@ -16,6 +16,9 @@ from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 
 from app.core.config import settings
 from app.core.database import async_engine
+from app.core.redis_clients import close_redis_clients
+from app.middleware.request_context_middleware import RequestContextMiddleware
+from app.services.fx_service import FXRateUnavailable
 from app.middleware.logging_middleware import RequestLoggingMiddleware, MetricsMiddleware
 from app.middleware.idempotency_middleware import IdempotencyMiddleware
 from app.routers import api_router
@@ -129,7 +132,8 @@ async def lifespan(app: FastAPI):
     yield   # ── Application runs ─────────────────────────────────────────────
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
-    logger.info("Shutting down — disposing DB engine")
+    logger.info("Shutting down — closing Redis and disposing DB engine")
+    await close_redis_clients()
     await async_engine.dispose()
 
 
@@ -149,19 +153,24 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+
+@app.exception_handler(FXRateUnavailable)
+async def fx_unavailable_handler(request: Request, exc: FXRateUnavailable):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Exchange rate service unavailable, please retry later"},
+        headers={"Retry-After": "30"},
+    )
+
 # ------------------------------------------------------------------------------
-# Middleware — order matters (outermost = first to receive request)
+# Middleware — Starlette wraps in REVERSE: the LAST one added is the OUTERMOST
+# (first to see a request, last to see the response).
 # ------------------------------------------------------------------------------
 
-# 1. CORS — must be first
-if settings.BACKEND_CORS_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[str(o) for o in settings.BACKEND_CORS_ORIGINS],
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID"],
-    )
+# 1. Idempotency (POST/PUT/PATCH) - innermost, closest to the routes
+app.add_middleware(IdempotencyMiddleware)
+app.add_middleware(RequestContextMiddleware)
 
 # 2. Structured request logging + request ID injection
 app.add_middleware(RequestLoggingMiddleware)
@@ -169,8 +178,17 @@ app.add_middleware(RequestLoggingMiddleware)
 # 3. Prometheus metrics counter
 app.add_middleware(MetricsMiddleware)
 
-# 4. Idempotency cache (POST/PUT/PATCH only)
-app.add_middleware(IdempotencyMiddleware)
+# 4. CORS - added LAST so it is the OUTERMOST layer and also decorates
+#    responses produced by the layers below (409/422/503 from idempotency)
+if settings.BACKEND_CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[str(o) for o in settings.BACKEND_CORS_ORIGINS],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-ID", "X-Auth-Mode"],
+        expose_headers=["Retry-After", "Idempotent-Replayed", "X-Request-ID"],
+    )
 
 # ------------------------------------------------------------------------------
 # Routers
@@ -196,46 +214,66 @@ async def liveness():
 @app.get("/ready", tags=["health"], include_in_schema=False)
 async def readiness():
     """
-    Kubernetes readiness probe — checks DB + Redis + Celery worker ping.
-    Returns 503 if any dependency is unhealthy.
+    Readiness probe. The API is ready when it can serve requests:
+      * PostgreSQL reachable AND the schema has been migrated
+      * state Redis reachable (idempotency, locks, token blacklist)
+    The cache Redis and Celery workers are reported but do NOT take the API
+    out of rotation: losing the cache only slows things down, and a worker
+    restart must not make the API unavailable.
+    Error details are logged, never returned to the caller.
     """
+    import asyncio
+
+    import sqlalchemy
+
+    from app.core.redis_clients import get_cache_redis, get_state_redis
+
     checks: dict[str, str] = {}
     healthy = True
 
-    # DB
     try:
         async with async_engine.connect() as conn:
-            await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
-        checks["database"] = "ok"
-    except Exception as e:
-        checks["database"] = f"error: {e}"
+            await conn.execute(sqlalchemy.text("SELECT 1"))
+            schema = await conn.execute(
+                sqlalchemy.text("SELECT to_regclass('public.organizations')")
+            )
+            if schema.scalar() is None:
+                checks["database"] = "schema missing: run alembic upgrade head"
+                healthy = False
+            else:
+                checks["database"] = "ok"
+    except Exception:
+        logger.exception("Readiness: database check failed")
+        checks["database"] = "error"
         healthy = False
 
-    # Redis
     try:
-        import redis.asyncio as aioredis
-        r = await aioredis.from_url(settings.REDIS_URL)
-        await r.ping()
-        await r.aclose()
-        checks["redis"] = "ok"
-    except Exception as e:
-        checks["redis"] = f"error: {e}"
+        await get_state_redis().ping()
+        checks["redis_state"] = "ok"
+    except Exception:
+        logger.exception("Readiness: state redis check failed")
+        checks["redis_state"] = "error"
         healthy = False
 
-    # Celery (inspect active workers — non-blocking)
+    try:
+        await get_cache_redis().ping()
+        checks["redis_cache"] = "ok"
+    except Exception:
+        logger.warning("Readiness: cache redis unavailable (non-fatal)")
+        checks["redis_cache"] = "unavailable"
+
     try:
         from app.core.celery_app import celery_app
-        i = celery_app.control.inspect(timeout=1.0)
-        workers = i.ping()
-        checks["celery"] = "ok" if workers else "no workers"
-        if not workers:
-            healthy = False
-    except Exception as e:
-        checks["celery"] = f"error: {e}"
-        healthy = False
 
-    status_code = 200 if healthy else 503
+        workers = await asyncio.to_thread(
+            lambda: celery_app.control.inspect(timeout=1.0).ping()
+        )
+        checks["celery"] = "ok" if workers else "no workers"
+    except Exception:
+        logger.warning("Readiness: celery inspect failed (non-fatal)")
+        checks["celery"] = "unavailable"
+
     return ORJSONResponse(
         content={"status": "ready" if healthy else "degraded", "checks": checks},
-        status_code=status_code,
+        status_code=200 if healthy else 503,
     )

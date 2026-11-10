@@ -15,6 +15,7 @@ from app.models.user import User, UserRole                    # noqa: F401
 from app.models.container import Container, ContainerType, AllocationMethod  # noqa: F401
 from app.models.expense import ContainerExpense, ExpenseType  # noqa: F401
 from app.models.item import Item, ItemCondition, ItemCategory # noqa: F401
+from app.models.idempotency import IdempotencyKey             # noqa: F401
 from app.models.pricing import PriceRecord, PricingMethod, PricingSource     # noqa: F401
 from app.models.tracking import TrackingRecord, TrackingStatus               # noqa: F401
 
@@ -64,5 +65,5 @@ __all__ = [
     "Shipment", "Port", "TransportLeg", "Document", "CustomsClearance",
     "Warehouse", "WarehouseInventory", "InventoryMovement",
     "Customer", "Supplier", "Order", "OrderItem", "Payment", "Sale",
-    "ExchangeRateHistory", "Notification", "AuditLog", "DemandAnalytics",
+    "ExchangeRateHistory", "Notification", "AuditLog", "DemandAnalytics", "IdempotencyKey",
 ]

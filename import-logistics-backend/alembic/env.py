@@ -1,57 +1,37 @@
 # alembic/env.py
-import asyncio
+"""Alembic environment.
+
+Migrations run over a plain SYNCHRONOUS connection (psycopg2) straight to PostgreSQL:
+  * DDL and advisory locks do not belong behind PgBouncer transaction pooling, so
+    ALEMBIC_DATABASE_URL (a direct URL) is preferred; DATABASE_URL is the fallback.
+  * The previous version set a sync URL but then built an ASYNC engine from it, which fails
+    with "The asyncio extension requires an async driver", so `alembic upgrade head` could never run.
+"""
 from logging.config import fileConfig
 
-from sqlalchemy import pool
-from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
-
 from alembic import context
+from sqlalchemy import engine_from_config, pool
 
-# ------------------------------------------------------------------------------
-# Import ALL models so Alembic detects every table for autogenerate.
-# app/models/__init__.py imports them all — one import is enough.
-# ------------------------------------------------------------------------------
-from app.models import Base          # noqa: F401 — registers all metadata
+# Import ALL models so every table is registered on Base.metadata (app/models/__init__.py imports them all)
 from app.core.config import settings
+from app.models import Base  # noqa: F401
 
-# Alembic config object
 config = context.config
+config.set_main_option("sqlalchemy.url", settings.SYNC_DATABASE_URL.replace("%", "%%"))
 
-# Use the SYNC database URL — Alembic does not support asyncpg directly
-config.set_main_option("sqlalchemy.url", settings.SYNC_DATABASE_URL)
-
-# Python logging from alembic.ini
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
 
 
-# ------------------------------------------------------------------------------
-# Offline migrations (generates SQL without a live DB connection)
-# ------------------------------------------------------------------------------
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
+    """Emit SQL without a live database connection (alembic upgrade head --sql)."""
     context.configure(
-        url=url,
+        url=config.get_main_option("sqlalchemy.url"),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        compare_type=True,           # detect column type changes
-        compare_server_default=True, # detect server_default changes
-    )
-    with context.begin_transaction():
-        context.run_migrations()
-
-
-# ------------------------------------------------------------------------------
-# Online migrations (async — runs against a live DB connection)
-# ------------------------------------------------------------------------------
-def do_run_migrations(connection: Connection) -> None:
-    context.configure(
-        connection=connection,
-        target_metadata=target_metadata,
         compare_type=True,
         compare_server_default=True,
     )
@@ -59,22 +39,22 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
-async def run_async_migrations() -> None:
-    """Create an async engine and run migrations inside a sync wrapper."""
-    connectable = async_engine_from_config(
+def run_migrations_online() -> None:
+    connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
-        poolclass=pool.NullPool,      # no connection pooling in migration context
+        poolclass=pool.NullPool,          # no pooling in a migration run
     )
-
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-
-    await connectable.dispose()
-
-
-def run_migrations_online() -> None:
-    asyncio.run(run_async_migrations())
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+            compare_server_default=True,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+    connectable.dispose()
 
 
 if context.is_offline_mode():

@@ -1,7 +1,7 @@
 # app/schemas/user.py
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr, field_validator, Field
 from app.models.user import UserRole
 
 
@@ -17,7 +17,7 @@ class UserBase(BaseModel):
 
 
 class UserCreate(UserBase):
-    password: str
+    password: str = Field(..., min_length=12, max_length=128)
     # Role defaults to VIEWER. ADMIN cannot be self-assigned —
     # admin creation is restricted to the admin-only POST /users/ endpoint.
     role: UserRole = UserRole.VIEWER
@@ -34,7 +34,7 @@ class UserCreate(UserBase):
 
 class UserAdminCreate(UserBase):
     """Admin-only creation schema — any role allowed."""
-    password: str
+    password: str = Field(..., min_length=12, max_length=128)
     role: UserRole = UserRole.VIEWER
 
 
@@ -43,7 +43,7 @@ class UserUpdate(BaseModel):
     username:   Optional[str]      = None
     first_name: Optional[str]      = None
     last_name:  Optional[str]      = None
-    password:   Optional[str]      = None
+    password:   Optional[str]      = Field(None, min_length=12, max_length=128)
     # Users cannot change their own role — handled in router
 
 
@@ -81,7 +81,7 @@ class UserPublic(BaseModel):
 # ------------------------------------------------------------------------------
 class Token(BaseModel):
     access_token:  str
-    refresh_token: str
+    refresh_token: Optional[str] = None   # omitted in web (cookie) mode
     token_type:    str = "bearer"
     expires_in:    int          # access token TTL in seconds
 

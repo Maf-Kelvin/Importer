@@ -84,12 +84,3 @@ opentelemetry-exporter-otlp==1.22.0
 # ==============================================================================
 python-dotenv==1.0.0
 orjson==3.9.10                   # Faster JSON serialization
-
-# ==============================================================================
-# Development & Testing (move to requirements-dev.txt in prod)
-# ==============================================================================
-pytest==7.4.3
-pytest-asyncio==0.21.1
-pytest-cov==4.1.0
-factory-boy==3.3.0
-faker==20.1.0

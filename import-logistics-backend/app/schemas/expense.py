@@ -7,12 +7,13 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.expense import ExpenseType
+from app.schemas.types import Money, PositiveMoney, Rate
 
 
 class ExpenseBase(BaseModel):
     container_id: int
     expense_type: ExpenseType
-    amount:       float = Field(..., gt=0)
+    amount:       PositiveMoney
     currency:     str   = Field(..., min_length=3, max_length=3)
     description:  Optional[str] = None
 
@@ -23,7 +24,7 @@ class ExpenseCreate(ExpenseBase):
 
 class ExpenseUpdate(BaseModel):
     expense_type: Optional[ExpenseType] = None
-    amount:       Optional[float]       = Field(None, gt=0)
+    amount:       Optional[PositiveMoney] = None
     currency:     Optional[str]         = Field(None, min_length=3, max_length=3)
     description:  Optional[str]         = None
 
@@ -31,8 +32,8 @@ class ExpenseUpdate(BaseModel):
 class ExpenseInDB(ExpenseBase):
     id:             int
     tenant_id:      int
-    fx_rate_to_usd: float
-    amount_usd:     float
+    fx_rate_to_usd: Rate
+    amount_usd:     Money
     created_at:     datetime       # fixed: was str
     updated_at:     datetime       # fixed: was str
 

@@ -114,6 +114,17 @@ class AuthService:
         user: User,
         update_data: dict,
     ) -> User:
+        # email and username are unique across the platform: report a clash as a conflict (409), not a crash
+        for field in ("email", "username"):
+            value = update_data.get(field)
+            if value is not None and value != getattr(user, field):
+                taken = (
+                    await self.db.execute(
+                        select(User.id).where(getattr(User, field) == value, User.id != user.id)
+                    )
+                ).first()
+                if taken:
+                    raise ValueError(f"That {field} is already in use")
         async with transaction(self.db):
             for field, value in update_data.items():
                 if field == "password" and value:

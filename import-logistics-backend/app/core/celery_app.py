@@ -17,6 +17,7 @@ celery_app = Celery(
         "app.workers.tracking_worker",
         "app.workers.pricing_worker",
         "app.workers.notification_worker",
+        "app.workers.maintenance_worker",
     ],
 )
 
@@ -98,6 +99,12 @@ celery_app.conf.beat_schedule = {
         "task":    "app.workers.notification_worker.send_tracking_notifications",
         "schedule": 3600.0,
         "options": {"queue": "notification_queue"},
+    },
+    # Delete expired idempotency records — daily at 03:15
+    "purge-idempotency-keys": {
+        "task":    "app.workers.maintenance_worker.purge_expired_idempotency_keys",
+        "schedule": crontab(minute=15, hour=3),
+        "options": {"queue": "default"},
     },
     # Demand analytics refresh — every 6 hours
     "refresh-demand-analytics": {

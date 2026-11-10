@@ -9,6 +9,7 @@ from typing import List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.pricing import PricingMethod, PricingSource
+from app.schemas.types import Money, PositiveMoney
 
 
 # ------------------------------------------------------------------------------
@@ -17,7 +18,7 @@ from app.models.pricing import PricingMethod, PricingSource
 class PriceRecordBase(BaseModel):
     item_id:           int
     method:            PricingMethod
-    price:             float = Field(..., gt=0)
+    price:             PositiveMoney
     currency:          str   = Field(..., min_length=3, max_length=3)
     source:            Optional[PricingSource] = None
     margin_percentage: Optional[float]         = None
@@ -54,19 +55,37 @@ class PricingRequest(BaseModel):
 
 class MarketPrice(BaseModel):
     source:     PricingSource
-    price:      float
+    price:      Money
     currency:   str
     url:        Optional[str]   = None
     confidence: float
     found_at:   datetime
+    price_usd:  Optional[Money] = None    # converted to USD for comparison
+    age_days:   Optional[float] = None
 
 
 class PricingResponse(BaseModel):
     item_id:            int
-    cost_based_price:   Optional[float]       = None
+    cost_based_price:   Optional[Money]       = None
     market_prices:      List[MarketPrice]     = []
-    last_sold_price:    Optional[float]       = None
-    recommended_price:  Optional[float]       = None
+    last_sold_price:    Optional[Money]       = None
+    recommended_price:  Optional[Money]       = None
     profit_margin:      Optional[float]       = None
-    landed_cost:        Optional[float]       = None
+    landed_cost:        Optional[Money]       = None
     generated_at:       datetime
+    # --- explainable recommendation ---
+    price_low:          Optional[Money]       = None   # suggested band (low)
+    price_high:         Optional[Money]       = None   # suggested band (high)
+    confidence:         Optional[float]       = None   # 0..1, how much to trust the market signal
+    expected_margin:    Optional[float]       = None   # (recommended - cost) / cost
+    comparables_used:   int                   = 0
+    warnings:           List[str]             = []
+    explanation:        List[str]             = []
+
+
+class PricingAccuracy(BaseModel):
+    """How close our recommendations were to what items actually sold for."""
+    n:            int
+    mape:         float   # mean absolute percentage error (lower is better)
+    bias:         float   # + = we recommend too high, - = too low
+    within_10pct: float   # share of sales within 10% of the recommendation

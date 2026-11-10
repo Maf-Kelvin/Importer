@@ -24,15 +24,32 @@ class Settings(BaseSettings):
     # --------------------------------------------------------------------------
     # Security — SECRET_KEY must be set via env in production
     # --------------------------------------------------------------------------
-    SECRET_KEY: str = secrets.token_urlsafe(32)
+    # Required in production. In development an empty value generates a random
+    # key (tokens then stop working on restart, which is fine locally).
+    SECRET_KEY: str = ""
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24        # 24 hours
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 30  # 30 days
     ALGORITHM: str = "HS256"
 
     @model_validator(mode="after")
-    def enforce_secret_key_in_prod(self) -> "Settings":
-        if self.ENVIRONMENT == "production" and self.SECRET_KEY == "":
-            raise ValueError("SECRET_KEY must be set in production environment")
+    def validate_production_settings(self) -> "Settings":
+        prod = self.ENVIRONMENT == "production"
+        if not self.SECRET_KEY:
+            if prod:
+                raise ValueError("SECRET_KEY must be set in production")
+            self.SECRET_KEY = secrets.token_urlsafe(64)
+        if prod:
+            weak = {"changeme", "change-me", "secret", "password", "your-secret-key"}
+            if len(self.SECRET_KEY) < 32 or self.SECRET_KEY.lower() in weak:
+                raise ValueError("SECRET_KEY must be at least 32 random characters")
+            if "user:password@" in self.DATABASE_URL:
+                raise ValueError("DATABASE_URL still contains the default credentials")
+            if self.DEBUG:
+                raise ValueError("DEBUG must be false in production")
+            insecure = [str(o) for o in self.BACKEND_CORS_ORIGINS
+                        if str(o).startswith("http://") and "localhost" not in str(o) and "127.0.0.1" not in str(o)]
+            if insecure:
+                raise ValueError(f"BACKEND_CORS_ORIGINS must use https in production: {insecure}")
         return self
 
     # --------------------------------------------------------------------------
@@ -54,16 +71,28 @@ class Settings(BaseSettings):
     DATABASE_POOL_SIZE: int = 20
     DATABASE_MAX_OVERFLOW: int = 40
     DATABASE_POOL_TIMEOUT: int = 30
+    # Set true when connecting through PgBouncer in transaction mode: asyncpg
+    # prepared statements do not survive connection switching there.
+    DATABASE_PGBOUNCER: bool = False
 
     # Sync URL used only by Alembic
+    # Alembic should talk to PostgreSQL directly (DDL and advisory locks do not
+    # belong behind PgBouncer transaction pooling). Falls back to DATABASE_URL.
+    ALEMBIC_DATABASE_URL: Optional[str] = None
+
     @property
     def SYNC_DATABASE_URL(self) -> str:
-        return self.DATABASE_URL.replace("+asyncpg", "")
+        return (self.ALEMBIC_DATABASE_URL or self.DATABASE_URL).replace("+asyncpg", "")
 
     # --------------------------------------------------------------------------
     # Redis
     # --------------------------------------------------------------------------
+    # REDIS_URL = durable "state" Redis: Celery broker, locks, idempotency keys,
+    # token blacklist. Run it with maxmemory-policy noeviction.
     REDIS_URL: str = "redis://localhost:6379/0"
+    # CACHE_REDIS_URL = disposable cache (dashboard, FX). Run it with allkeys-lru.
+    # Falls back to REDIS_URL when unset (fine for local development).
+    CACHE_REDIS_URL: Optional[str] = None
 
     # --------------------------------------------------------------------------
     # Celery
@@ -78,6 +107,18 @@ class Settings(BaseSettings):
     MSC_API_URL: str = "https://api.msc.com"
     EXCHANGERATE_API_KEY: Optional[str] = None
     EXCHANGERATE_API_URL: str = "https://api.exchangerate-api.com/v4/latest/"
+    # Hard-coded fallback rates are only used outside production unless this is true
+    FX_ALLOW_FALLBACK: bool = False
+    # Public self-registration into the default tenant. Keep false unless you
+    # really want anyone to be able to create an account.
+    REGISTRATION_OPEN: bool = False
+    # Web clients send `X-Auth-Mode: cookie`: the refresh token then lives in an httpOnly cookie
+    # (invisible to JavaScript) instead of the JSON body.
+    REFRESH_COOKIE_NAME: str = "refresh_token"
+    COOKIE_SECURE: Optional[bool] = None      # default: true in production, false otherwise
+    # Trust the X-Real-IP header (set by Nginx) for the audit trail. Only enable
+    # when the API is reachable exclusively through your reverse proxy.
+    TRUST_PROXY_HEADERS: bool = False
 
     # --------------------------------------------------------------------------
     # Object Storage (S3 / Cloudflare R2)
@@ -99,7 +140,7 @@ class Settings(BaseSettings):
     # Email
     # --------------------------------------------------------------------------
     EMAIL_ENABLED: bool = False
-    EMAIL_PROVIDER: str = "smtp"             # smtp | sendgrid | mailgun | ses
+    EMAIL_PROVIDER: str = "smtp"             # smtp | sendgrid | mailgun
     SMTP_TLS: bool = True
     SMTP_PORT: int = 587
     SMTP_HOST: Optional[str] = None
@@ -128,6 +169,9 @@ class Settings(BaseSettings):
     # Pricing
     # --------------------------------------------------------------------------
     DEFAULT_PROFIT_MARGIN: float = 0.20
+    PRICING_MIN_MARGIN: float = 0.05           # never recommend below landed cost x 1.05
+    PRICING_HALF_LIFE_DAYS: float = 30.0       # a comparable price loses half its weight every 30 days
+    PRICING_MAX_COMP_AGE_DAYS: int = 180       # ignore market prices older than this
     MIN_PROFIT_MARGIN: float = 0.05
     MAX_PROFIT_MARGIN: float = 1.0
     SCRAPING_ENABLED: bool = True
@@ -165,7 +209,13 @@ class Settings(BaseSettings):
     # --------------------------------------------------------------------------
     # Idempotency
     # --------------------------------------------------------------------------
-    IDEMPOTENCY_KEY_TTL: int = 86400         # 24 hours in seconds
+    IDEMPOTENCY_KEY_TTL: int = 86400         # how long a finished response is replayable
+    # postgres = durable source of truth (default); redis = faster but can lose keys on flush/restart
+    IDEMPOTENCY_BACKEND: str = "postgres"
+    IDEMPOTENCY_LOCK_TTL: int = 120          # how long an in-flight claim is held
+    IDEMPOTENCY_MAX_BODY: int = 12 * 1024 * 1024
+    # If Redis is down: True = reject the request (503), False = run it unprotected
+    IDEMPOTENCY_FAIL_CLOSED: bool = True
 
     # --------------------------------------------------------------------------
     # Elasticsearch (optional, falls back to PostgreSQL FTS)

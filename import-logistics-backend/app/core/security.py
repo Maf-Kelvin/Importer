@@ -87,25 +87,31 @@ def verify_token_type(payload: dict, expected_type: str) -> bool:
 # blacklisted tokens are stored until their natural expiry so we never
 # need a background cleanup job.
 # ------------------------------------------------------------------------------
-import redis.asyncio as aioredis
+import hashlib
+
+from app.core.redis_clients import get_state_redis
 
 
-async def _get_redis() -> aioredis.Redis:
-    return await aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+def _blacklist_key(token: str) -> str:
+    # Store a hash, never the raw token, so a Redis leak does not leak sessions
+    return "bl:" + hashlib.sha256(token.encode()).hexdigest()
 
 
 async def blacklist_token(token: str, expires_in_seconds: int) -> None:
     """Add token to blacklist. Key expires automatically."""
-    r = await _get_redis()
-    await r.setex(f"bl:{token}", expires_in_seconds, "1")
-    await r.aclose()
+    if expires_in_seconds <= 0:
+        return
+    await get_state_redis().setex(_blacklist_key(token), expires_in_seconds, "1")
+
+
+async def consume_token(token: str, expires_in_seconds: int) -> bool:
+    """Atomically mark a token as used. True only for the first caller (see token_rotation)."""
+    from app.core.token_rotation import consume_once
+    return await consume_once(get_state_redis(), _blacklist_key(token), expires_in_seconds)
 
 
 async def is_token_blacklisted(token: str) -> bool:
-    r = await _get_redis()
-    result = await r.exists(f"bl:{token}")
-    await r.aclose()
-    return bool(result)
+    return bool(await get_state_redis().exists(_blacklist_key(token)))
 
 
 # ------------------------------------------------------------------------------
@@ -113,25 +119,19 @@ async def is_token_blacklisted(token: str) -> bool:
 # ------------------------------------------------------------------------------
 async def record_failed_login(username: str) -> int:
     """Increment failed login counter. Returns current count."""
-    r = await _get_redis()
+    r = get_state_redis()
     key = f"login_fail:{username}"
     count = await r.incr(key)
     # Set expiry only on first failure so the window resets correctly
     if count == 1:
         await r.expire(key, settings.LOCKOUT_DURATION_MINUTES * 60)
-    await r.aclose()
     return int(count)
 
 
 async def clear_failed_logins(username: str) -> None:
-    r = await _get_redis()
-    await r.delete(f"login_fail:{username}")
-    await r.aclose()
+    await get_state_redis().delete(f"login_fail:{username}")
 
 
 async def is_account_locked(username: str) -> bool:
-    r = await _get_redis()
-    key   = f"login_fail:{username}"
-    count = await r.get(key)
-    await r.aclose()
+    count = await get_state_redis().get(f"login_fail:{username}")
     return int(count or 0) >= settings.MAX_LOGIN_ATTEMPTS

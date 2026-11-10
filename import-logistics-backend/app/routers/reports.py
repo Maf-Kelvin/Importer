@@ -5,7 +5,7 @@
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +13,9 @@ from app.routers.deps import CurrentUser, DBDep, ManagerUser
 from app.models.container import Container
 from app.models.expense import ContainerExpense
 from app.models.item import Item, ItemCategory
+from app.models.warehouse import Warehouse, WarehouseInventory
+from app.utils.money import quantize
+from app.utils.reporting import profit_and_margin, unallocated
 from app.models.user import UserRole
 from app.schemas.reports import (
     CategoryReport,
@@ -44,44 +47,68 @@ async def get_dashboard(db: DBDep, current_user: CurrentUser):
 
     tenant_id = current_user.tenant_id
 
-    # Single-pass aggregation queries
+    # Visibility policy (same as the container and item lists): a CLERK sees only the containers
+    # they own, and therefore only the totals of those containers. Everyone else sees the whole
+    # organisation. Organisation-wide stock levels are not a clerk's data, so they get 0 there.
+    is_clerk = current_user.role == UserRole.CLERK
+    scope = [Container.owner_id == current_user.id] if is_clerk else []
+
     container_q = select(func.count(Container.id)).where(
         Container.tenant_id == tenant_id,
         Container.deleted_at.is_(None),
+        *scope,
     )
     active_containers = (await db.execute(container_q)).scalar_one()
 
-    items_q = select(
-        func.count(Item.id),
-        func.count(Item.id).filter(Item.sold == True),        # noqa: E712
-        func.coalesce(func.sum(Item.selling_price).filter(Item.sold == True), 0),
-        func.coalesce(func.sum(Item.landed_cost), 0),
-    ).where(Item.tenant_id == tenant_id, Item.deleted_at.is_(None))
+    sold = Item.sold == True        # noqa: E712
+    items_q = (
+        select(
+            func.count(Item.id),
+            func.count(Item.id).filter(sold),
+            func.coalesce(func.sum(Item.selling_price).filter(sold), 0),
+            func.coalesce(func.sum(Item.landed_cost).filter(sold), 0),
+            func.coalesce(func.sum(Item.landed_cost).filter(~sold), 0),
+        )
+        .select_from(Item)
+        .join(Container, Container.id == Item.container_id)
+        .where(
+            Item.tenant_id == tenant_id,
+            Item.deleted_at.is_(None),
+            Container.deleted_at.is_(None),     # items of a deleted container no longer count
+            *scope,
+        )
+    )
 
-    row = (await db.execute(items_q)).one()
-    total_items, items_sold, total_revenue, total_cost = row
-    total_profit   = float(total_revenue) - float(total_cost)
-    avg_margin     = (total_profit / float(total_cost)) if total_cost else 0.0
+    total_items, items_sold, revenue, cogs, inventory = (await db.execute(items_q)).one()
+    total_profit, avg_margin = profit_and_margin(revenue, cogs)
 
     shipments_q = select(func.count(Container.id)).where(
         Container.tenant_id == tenant_id,
         Container.is_shipped == True,          # noqa: E712
         Container.deleted_at.is_(None),
+        *scope,
     )
     pending_shipments = (await db.execute(shipments_q)).scalar_one()
 
-    from app.models.warehouse import WarehouseInventory
-    low_stock_q = select(func.count(WarehouseInventory.id)).where(
-        WarehouseInventory.quantity <= WarehouseInventory.min_quantity,
-        WarehouseInventory.min_quantity > 0,
+    # Low stock: ONLY this organisation's warehouses (this query used to count every tenant's rows)
+    low_stock_q = (
+        select(func.count(WarehouseInventory.id))
+        .join(Warehouse, Warehouse.id == WarehouseInventory.warehouse_id)
+        .where(
+            Warehouse.tenant_id == tenant_id,
+            WarehouseInventory.quantity <= WarehouseInventory.min_quantity,
+            WarehouseInventory.min_quantity > 0,
+        )
     )
-    low_stock = (await db.execute(low_stock_q)).scalar_one()
+    low_stock = 0 if is_clerk else (await db.execute(low_stock_q)).scalar_one()
 
     summary = DashboardSummary(
         active_containers=active_containers,
         total_items=total_items,
         items_sold=items_sold,
-        total_revenue=float(total_revenue),
+        total_revenue=quantize(revenue),
+        cost_of_goods_sold=quantize(cogs),
+        inventory_value=quantize(inventory),
         total_profit=total_profit,
         avg_profit_margin=avg_margin,
         pending_shipments=pending_shipments,
@@ -107,9 +134,10 @@ async def get_profit_report_items(
     start_date:   Optional[date] = Query(None),
     end_date:     Optional[date] = Query(None),
 ):
-    q = select(Item).join(Container).where(
+    q = select(Item).join(Container, Container.id == Item.container_id).where(
         Item.tenant_id  == current_user.tenant_id,
         Item.deleted_at.is_(None),
+        Container.deleted_at.is_(None),
     )
     if current_user.role == UserRole.CLERK:
         q = q.where(Container.owner_id == current_user.id)
@@ -136,9 +164,10 @@ async def get_profit_report_items(
             allocated_cost=i.allocated_cost,
             landed_cost=i.landed_cost,
             selling_price=i.selling_price,
-            profit_amount=(i.selling_price - i.landed_cost) if i.selling_price and i.landed_cost else None,
-            profit_margin=((i.selling_price - i.landed_cost) / i.landed_cost)
-                          if i.selling_price and i.landed_cost else None,
+            profit_amount=quantize(i.selling_price - i.landed_cost)
+                          if i.selling_price is not None and i.landed_cost else None,
+            profit_margin=float(quantize((i.selling_price - i.landed_cost) / i.landed_cost, 6))
+                          if i.selling_price is not None and i.landed_cost else None,
             sold=i.sold,
             sold_date=i.sold_date,
         )
@@ -156,48 +185,68 @@ async def get_container_reports(
     current_user: ManagerUser,
     owner_id: Optional[int] = Query(None),
 ):
-    # Fixed: single SQL query with aggregation — was N+1 per container before
+    tid  = current_user.tenant_id
+    sold = Item.sold == True        # noqa: E712
+
+    # Expenses and items are aggregated SEPARATELY, then joined 1:1 per container.
+    # (Joining both tables to containers multiplied every total by the other's row count.)
+    exp_sq = (
+        select(
+            ContainerExpense.container_id.label("cid"),
+            func.sum(ContainerExpense.amount_usd).label("total_expenses"),
+        )
+        .where(ContainerExpense.tenant_id == tid)
+        .group_by(ContainerExpense.container_id)
+        .subquery()
+    )
+    item_sq = (
+        select(
+            Item.container_id.label("cid"),
+            func.count(Item.id).label("total_items"),
+            func.count(Item.id).filter(sold).label("items_sold"),
+            func.sum(Item.landed_cost).label("total_cost"),
+            func.sum(Item.landed_cost).filter(sold).label("cogs"),
+            func.sum(Item.landed_cost).filter(~sold).label("inventory"),
+            func.sum(Item.selling_price).filter(sold).label("revenue"),
+            func.sum(Item.allocated_cost).label("allocated"),
+        )
+        .where(Item.tenant_id == tid, Item.deleted_at.is_(None))
+        .group_by(Item.container_id)
+        .subquery()
+    )
     q = (
         select(
-            Container.id,
-            Container.name,
-            Container.container_type,
-            Container.created_at,
-            func.coalesce(func.sum(ContainerExpense.amount_usd), 0).label("total_expenses"),
-            func.count(Item.id).label("total_items"),
-            func.count(Item.id).filter(Item.sold == True).label("items_sold"),   # noqa: E712
-            func.coalesce(func.sum(Item.landed_cost), 0).label("total_cost"),
-            func.coalesce(
-                func.sum(Item.selling_price).filter(Item.sold == True), 0   # noqa: E712
-            ).label("total_revenue"),
+            Container.id, Container.name, Container.container_type, Container.created_at,
+            exp_sq.c.total_expenses, item_sq.c.total_items, item_sq.c.items_sold,
+            item_sq.c.total_cost, item_sq.c.cogs, item_sq.c.inventory,
+            item_sq.c.revenue, item_sq.c.allocated,
         )
-        .outerjoin(ContainerExpense, ContainerExpense.container_id == Container.id)
-        .outerjoin(Item, Item.container_id == Container.id)
-        .where(
-            Container.tenant_id  == current_user.tenant_id,
-            Container.deleted_at.is_(None),
-        )
-        .group_by(Container.id)
+        .select_from(Container)
+        .outerjoin(exp_sq, exp_sq.c.cid == Container.id)
+        .outerjoin(item_sq, item_sq.c.cid == Container.id)
+        .where(Container.tenant_id == tid, Container.deleted_at.is_(None))
+        .order_by(Container.id)
     )
     if owner_id:
         q = q.where(Container.owner_id == owner_id)
 
-    rows   = (await db.execute(q)).all()
     reports = []
-    for row in rows:
-        profit        = float(row.total_revenue) - float(row.total_cost)
-        profit_margin = profit / float(row.total_cost) if row.total_cost else 0.0
+    for row in (await db.execute(q)).all():
+        profit, margin = profit_and_margin(row.revenue, row.cogs)
         reports.append(ContainerReport(
             container_id=row.id,
             container_name=row.name,
             container_type=row.container_type.value,
-            total_expenses=float(row.total_expenses),
-            total_items=row.total_items,
-            items_sold=row.items_sold,
-            total_cost=float(row.total_cost),
-            total_revenue=float(row.total_revenue),
+            total_expenses=quantize(row.total_expenses or 0),
+            total_items=row.total_items or 0,
+            items_sold=row.items_sold or 0,
+            total_cost=quantize(row.total_cost or 0),
+            cost_of_goods_sold=quantize(row.cogs or 0),
+            inventory_value=quantize(row.inventory or 0),
+            unallocated_expenses=unallocated(row.total_expenses, row.allocated),
+            total_revenue=quantize(row.revenue or 0),
             total_profit=profit,
-            profit_margin=profit_margin,
+            profit_margin=margin,
             created_at=row.created_at,
         ))
     return reports
@@ -206,50 +255,46 @@ async def get_container_reports(
 @router.get(
     "/profit/categories",
     response_model=list[CategoryReport],
-    summary="Per-category profit report — SQL GROUP BY",
+    summary="Per-category profit report - SQL GROUP BY",
 )
 async def get_category_reports(db: DBDep, current_user: CurrentUser):
-    # Fixed: SQL GROUP BY instead of Python grouping with full table scan
+    sold = Item.sold == True        # noqa: E712
     q = (
         select(
             Item.category,
             func.count(Item.id).label("total_items"),
-            func.count(Item.id).filter(Item.sold == True).label("items_sold"),   # noqa: E712
+            func.count(Item.id).filter(sold).label("items_sold"),
             func.coalesce(func.sum(Item.landed_cost), 0).label("total_investment"),
-            func.coalesce(
-                func.sum(Item.selling_price).filter(Item.sold == True), 0   # noqa: E712
-            ).label("total_revenue"),
-            func.coalesce(
-                func.avg(Item.selling_price).filter(Item.sold == True), 0   # noqa: E712
-            ).label("avg_sale_price"),
+            func.coalesce(func.sum(Item.landed_cost).filter(sold), 0).label("cogs"),
+            func.coalesce(func.sum(Item.landed_cost).filter(~sold), 0).label("inventory"),
+            func.coalesce(func.sum(Item.selling_price).filter(sold), 0).label("revenue"),
+            func.avg(Item.selling_price).filter(sold).label("avg_sale_price"),
         )
-        .join(Container)
-        .where(
-            Item.tenant_id  == current_user.tenant_id,
-            Item.deleted_at.is_(None),
-        )
+        .join(Container, Container.id == Item.container_id)
+        .where(Item.tenant_id == current_user.tenant_id, Item.deleted_at.is_(None),
+               Container.deleted_at.is_(None))
         .group_by(Item.category)
+        .order_by(Item.category)
     )
     if current_user.role == UserRole.CLERK:
         q = q.where(Container.owner_id == current_user.id)
 
-    rows = (await db.execute(q)).all()
-    return [
-        CategoryReport(
+    out = []
+    for row in (await db.execute(q)).all():
+        profit, margin = profit_and_margin(row.revenue, row.cogs)
+        out.append(CategoryReport(
             category=row.category.value,
             total_items=row.total_items,
             items_sold=row.items_sold,
-            total_investment=float(row.total_investment),
-            total_revenue=float(row.total_revenue),
-            total_profit=float(row.total_revenue) - float(row.total_investment),
-            average_margin=(
-                (float(row.total_revenue) - float(row.total_investment))
-                / float(row.total_investment)
-            ) if row.total_investment else 0.0,
-            avg_sale_price=float(row.avg_sale_price) if row.avg_sale_price else None,
-        )
-        for row in rows
-    ]
+            total_investment=quantize(row.total_investment),
+            cost_of_goods_sold=quantize(row.cogs),
+            inventory_value=quantize(row.inventory),
+            total_revenue=quantize(row.revenue),
+            total_profit=profit,
+            average_margin=margin,
+            avg_sale_price=quantize(row.avg_sale_price) if row.avg_sale_price is not None else None,
+        ))
+    return out
 
 
 @router.get(
@@ -259,6 +304,12 @@ async def get_category_reports(db: DBDep, current_user: CurrentUser):
 )
 async def get_demand_analytics(db: DBDep, current_user: CurrentUser):
     from app.models.analytics import DemandAnalytics
+    if current_user.role == UserRole.CLERK:
+        # These figures are organisation-wide and cannot be narrowed to a clerk's own containers
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Organisation-wide demand analytics are not available to clerks",
+        )
     result = await db.execute(
         select(DemandAnalytics)
         .where(DemandAnalytics.tenant_id == current_user.tenant_id)
