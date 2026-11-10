@@ -1,15 +1,22 @@
+
 # docker/docker-compose.yml — Development environment
-# Passwords are set via .env file — never hardcode in production
-version: "3.9"
+# Passwords and secrets are supplied through the root .env file.
+# Never commit .env to version control.
 
 x-common-env: &common-env
-  DATABASE_URL:          postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-  REDIS_URL:             redis://redis:6379/0
-  CELERY_BROKER_URL:     redis://redis:6379/0
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-import_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@db:5432/${POSTGRES_DB:-import_logistics}
+  BACKEND_CORS_ORIGINS: '${BACKEND_CORS_ORIGINS:-["http://localhost:5173"]}'
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
   CELERY_RESULT_BACKEND: redis://redis:6379/1
-  CACHE_REDIS_URL:       redis://redis-cache:6379/0
-  ENVIRONMENT:           development
-  DEBUG:                 "true"
+  CACHE_REDIS_URL: redis://redis-cache:6379/0
+  ENVIRONMENT: development
+  DEBUG: "true"
+
+# Application services use PgBouncer instead of connecting directly
+# to PostgreSQL. The migration service retains the direct connection.
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-import_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@pgbouncer:5432/${POSTGRES_DB:-import_logistics}
 
 services:
 
@@ -18,39 +25,45 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER:     ${POSTGRES_USER:-import_user}
+      POSTGRES_USER: ${POSTGRES_USER:-import_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
-      POSTGRES_DB:       ${POSTGRES_DB:-import_logistics}
+      POSTGRES_DB: ${POSTGRES_DB:-import_logistics}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test:     ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-import_user}"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 10s
-      timeout:  5s
-      retries:  5
+      timeout: 5s
+      retries: 5
 
   # ── PgBouncer — connection pooler ──────────────────────────────────
   pgbouncer:
-    image: bitnami/pgbouncer:latest
+    image: edoburu/pgbouncer:latest
     restart: unless-stopped
     environment:
-      POSTGRESQL_HOST:     db
-      POSTGRESQL_PORT:     5432
-      POSTGRESQL_USERNAME: ${POSTGRES_USER:-import_user}
-      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
-      POSTGRESQL_DATABASE: ${POSTGRES_DB:-import_logistics}
-      PGBOUNCER_POOL_MODE: transaction
-      PGBOUNCER_MAX_CLIENT_CONN: 200
-      PGBOUNCER_DEFAULT_POOL_SIZE: 25
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-import_user}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      DB_NAME: ${POSTGRES_DB:-import_logistics}
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 200
+      DEFAULT_POOL_SIZE: 25
     ports:
-      - "6432:6432"
+      - "6432:5432"
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U \"$${DB_USER}\" -d \"$${DB_NAME}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # ── Redis ──────────────────────────────────────────────────────────
+  # ── Redis — durable application state ──────────────────────────────
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -60,28 +73,28 @@ services:
     ports:
       - "6379:6379"
     healthcheck:
-      test:     ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
-      timeout:  3s
-      retries:  3
+      timeout: 3s
+      retries: 3
 
-  # Disposable cache (LRU) kept separate from the durable state Redis above
+  # ── Redis — disposable cache ───────────────────────────────────────
   redis-cache:
     image: redis:7-alpine
     restart: unless-stopped
     command: redis-server --save "" --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lru
     healthcheck:
-      test:     ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
-      timeout:  3s
-      retries:  3
+      timeout: 3s
+      retries: 3
 
   # ── One-shot schema migration ──────────────────────────────────────
   migrate:
     build:
-      context:    ..
+      context: ..
       dockerfile: docker/Dockerfile
-      target:     development
+      target: development
     restart: "no"
     environment:
       <<: *common-env
@@ -97,40 +110,44 @@ services:
   # ── FastAPI application ────────────────────────────────────────────
   web:
     build:
-      context:    ..
+      context: ..
       dockerfile: docker/Dockerfile
-      target:     development
+      target: development
     restart: unless-stopped
     environment:
-      <<: *common-env
+      <<: [*common-env, *app-env]
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
     ports:
       - "8000:8000"
     depends_on:
       migrate:
         condition: service_completed_successfully
-      db:
+      pgbouncer:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      redis-cache:
         condition: service_healthy
     volumes:
       - ../app:/app/app
       - ../uploads:/app/uploads
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-  # ── Celery workers — one per queue ────────────────────────────────
+  # ── Celery worker — tracking ───────────────────────────────────────
   worker-tracking:
     build:
-      context:    ..
+      context: ..
       dockerfile: docker/Dockerfile
-      target:     development
+      target: development
     restart: unless-stopped
     environment:
-      <<: *common-env
+      <<: [*common-env, *app-env]
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
     depends_on:
-      - db
-      - redis
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - ../app:/app/app
     command: >
@@ -140,23 +157,27 @@ services:
       --concurrency=2
       --hostname=worker-tracking@%h
     healthcheck:
-      test:     ["CMD", "celery", "-A", "app.core.celery_app", "inspect", "ping", "-d", "worker-tracking@%h"]
+      test: ["CMD", "celery", "-A", "app.core.celery_app", "inspect", "ping", "--timeout=5"]
       interval: 30s
-      timeout:  10s
-      retries:  3
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
+  # ── Celery worker — pricing and scraping ──────────────────────────
   worker-pricing:
     build:
-      context:    ..
+      context: ..
       dockerfile: docker/Dockerfile
-      target:     development
+      target: development
     restart: unless-stopped
     environment:
-      <<: *common-env
+      <<: [*common-env, *app-env]
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
     depends_on:
-      - db
-      - redis
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - ../app:/app/app
     command: >
@@ -166,18 +187,21 @@ services:
       --concurrency=2
       --hostname=worker-pricing@%h
 
+  # ── Celery worker — FX and notifications ──────────────────────────
   worker-fx-notify:
     build:
-      context:    ..
+      context: ..
       dockerfile: docker/Dockerfile
-      target:     development
+      target: development
     restart: unless-stopped
     environment:
-      <<: *common-env
+      <<: [*common-env, *app-env]
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
     depends_on:
-      - db
-      - redis
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - ../app:/app/app
     command: >
@@ -187,18 +211,21 @@ services:
       --concurrency=2
       --hostname=worker-fx-notify@%h
 
-  # ── Celery Beat scheduler ──────────────────────────────────────────
+  # ── Celery Beat scheduler ─────────────────────────────────────────
   celery-beat:
     build:
-      context:    ..
+      context: ..
       dockerfile: docker/Dockerfile
-      target:     development
+      target: development
     restart: unless-stopped
     environment:
-      <<: *common-env
+      <<: [*common-env, *app-env]
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
     volumes:
       - ../app:/app/app
       - beat_data:/app/celerybeat
@@ -210,24 +237,28 @@ services:
   # ── Flower — Celery monitoring UI ─────────────────────────────────
   flower:
     build:
-      context:    ..
+      context: ..
       dockerfile: docker/Dockerfile
-      target:     development
+      target: development
     restart: unless-stopped
     environment:
-      CELERY_BROKER_URL:     redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/0
-      FLOWER_BASIC_AUTH:     ${FLOWER_USER:-admin}:${FLOWER_PASSWORD:?FLOWER_PASSWORD must be set}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      FLOWER_BASIC_AUTH: "${FLOWER_USER:-admin}:${FLOWER_PASSWORD:?FLOWER_PASSWORD must be set}"
     ports:
       - "5555:5555"
     depends_on:
-      - redis
-    command: >
-      celery -A app.core.celery_app flower
-      --port=5555
-      --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD}
+      redis:
+        condition: service_healthy
+    command:
+      - celery
+      - -A
+      - app.core.celery_app
+      - flower
+      - --port=5555
+      - "--basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:?FLOWER_PASSWORD must be set}"
 
-  # ── Prometheus ─────────────────────────────────────────────────────
+  # ── Prometheus ────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:latest
     restart: unless-stopped
@@ -246,7 +277,7 @@ services:
     restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD must be set}
-      GF_USERS_ALLOW_SIGN_UP:     "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - grafana_data:/var/lib/grafana
     ports:

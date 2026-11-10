@@ -60,3 +60,7 @@ logs/
 # TLS material
 docker/nginx/ssl/*.pem
 docker/nginx/ssl/*.key
+
+# Local development backups and restored upload staging folders
+backups/
+uploads-restored-*/
