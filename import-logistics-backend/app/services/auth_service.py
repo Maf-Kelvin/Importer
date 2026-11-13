@@ -13,7 +13,9 @@ from app.core.security import (
     is_account_locked,
     record_failed_login,
     clear_failed_logins,
+    login_lock_key,
 )
+from app.core import request_context
 from app.models.user import User, UserRole
 from app.schemas.user import UserCreate, UserAdminCreate
 
@@ -50,21 +52,24 @@ class AuthService:
         Enforces account lockout after MAX_LOGIN_ATTEMPTS failures.
         Updates last_login on success.
         """
+        # Lockout is per (username, client IP), so strangers cannot lock a user out
+        lock_key = login_lock_key(username, request_context.client_ip.get())
+
         # Check lockout before any DB query
-        if await is_account_locked(username):
+        if await is_account_locked(lock_key):
             logger.warning("Locked account login attempt: %s", username)
             return None
 
         user = await self.get_user_by_username(username)
         if not user or not verify_password(password, user.hashed_password):
-            count = await record_failed_login(username)
+            count = await record_failed_login(lock_key)
             logger.warning(
                 "Failed login attempt %d for username=%s", count, username
             )
             return None
 
         # Success — reset counter and update last_login
-        await clear_failed_logins(username)
+        await clear_failed_logins(lock_key)
         async with transaction(self.db):
             user.last_login = datetime.now(UTC)
             user.failed_login_attempts = 0

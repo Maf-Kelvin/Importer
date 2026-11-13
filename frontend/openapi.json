@@ -1317,6 +1317,9 @@
               },
               {
                 "type": "string"
+              },
+              {
+                "type": "null"
               }
             ],
             "title": "Weight"
@@ -1328,8 +1331,7 @@
           "category",
           "condition",
           "purchase_price",
-          "purchase_currency",
-          "weight"
+          "purchase_currency"
         ],
         "title": "ItemCreate",
         "type": "object"
@@ -1479,8 +1481,15 @@
             "title": "Volume"
           },
           "weight": {
-            "title": "Weight",
-            "type": "number"
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight"
           }
         },
         "required": [
@@ -1490,7 +1499,6 @@
           "condition",
           "purchase_price",
           "purchase_currency",
-          "weight",
           "id",
           "tenant_id",
           "fx_rate_to_usd",
@@ -1812,8 +1820,15 @@
             "title": "Volume"
           },
           "weight": {
-            "title": "Weight",
-            "type": "number"
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight"
           }
         },
         "required": [
@@ -1823,7 +1838,6 @@
           "condition",
           "purchase_price",
           "purchase_currency",
-          "weight",
           "id",
           "tenant_id",
           "fx_rate_to_usd",

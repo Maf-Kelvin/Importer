@@ -56,7 +56,7 @@ class Item(SoftDeleteModel):
     purchase_price_usd: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
 
     # Physical
-    weight: Mapped[Decimal]      = mapped_column(Numeric(12, 3), nullable=False)
+    weight: Mapped[Decimal|None] = mapped_column(Numeric(12, 3), nullable=True)   # optional: unknown at purchase
     volume: Mapped[Decimal|None] = mapped_column(Numeric(12, 3), nullable=True)
 
     # Cost allocation

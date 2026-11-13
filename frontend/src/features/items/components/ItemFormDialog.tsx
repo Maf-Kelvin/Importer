@@ -85,8 +85,8 @@ function ItemForm({ containerId, item, onDone }: { containerId: number; item?: I
         </FormField>
       </div>
       <div className="grid gap-4 sm:grid-cols-2">
-        <FormField label="Weight (kg)" error={errors.weight?.message} hint="Used to split costs by weight" required>
-          <Input inputMode="decimal" placeholder="0.000" {...register('weight')} />
+        <FormField label="Weight (kg)" error={errors.weight?.message} hint="Optional. Needed only to split costs by weight">
+          <Input inputMode="decimal" placeholder="Optional" {...register('weight')} />
         </FormField>
         <FormField label="Volume (m3)" error={errors.volume?.message}>
           <Input inputMode="decimal" placeholder="Optional" {...register('volume')} />

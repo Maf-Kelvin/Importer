@@ -1,7 +1,6 @@
-
 # app/routers/health.py
 # NOTE: /health and /ready are also mounted directly on app in main.py
-# (outside the rate limiter). This router provides versioned equivalents
+# (outside the nginx rate limits). This router provides versioned equivalents
 # under /api/v1/health for internal service-to-service checks.
 
 from fastapi import APIRouter

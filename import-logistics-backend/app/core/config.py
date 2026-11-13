@@ -1,4 +1,3 @@
-
 # app/core/config.py
 
 import secrets
@@ -31,7 +30,7 @@ class Settings(BaseSettings):
     # Required in production. In development an empty value generates a random
     # key (tokens then stop working on restart, which is fine locally).
     SECRET_KEY: str = ""
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24        # 24 hours
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30             # short: the web app refreshes silently
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 30  # 30 days
     ALGORITHM: str = "HS256"
 
@@ -244,13 +243,6 @@ class Settings(BaseSettings):
     # Tracking
     # --------------------------------------------------------------------------
     TRACKING_CHECK_INTERVAL: int = 3600      # seconds
-
-    # --------------------------------------------------------------------------
-    # Rate Limiting
-    # --------------------------------------------------------------------------
-    RATE_LIMIT_LOGIN: str = "5/minute"
-    RATE_LIMIT_API: str = "100/minute"
-    RATE_LIMIT_TRACKING: str = "20/minute"
 
     # --------------------------------------------------------------------------
     # Account Lockout

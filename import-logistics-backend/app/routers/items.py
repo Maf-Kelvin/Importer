@@ -12,7 +12,7 @@ from app.schemas.item import (
     ItemWithPricing,
     MarkSoldRequest,
 )
-from app.services.container_service import ContainerService
+from app.services.container_service import ContainerService, ItemAlreadySoldError
 
 router = APIRouter()
 
@@ -130,8 +130,10 @@ async def mark_item_sold(
     svc  = ContainerService(db)
     try:
         item = await svc.mark_item_sold(item_id, data, current_user)
+    except ItemAlreadySoldError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        raise HTTPException(status_code=422, detail=str(exc))
     if not item:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

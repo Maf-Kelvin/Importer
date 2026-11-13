@@ -88,6 +88,14 @@ class CostAllocationService:
             )
 
             by_weight = chosen == AllocationMethod.WEIGHT_BASED.value
+            if by_weight:
+                missing = [i.name for i in items if i.weight is None]
+                if missing:
+                    shown = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
+                    raise AllocationError(
+                        f"{len(missing)} item(s) have no weight ({shown}). "
+                        "Add their weights, or allocate by value instead."
+                    )
             bases = [
                 to_decimal(i.weight if by_weight else i.purchase_price_usd) for i in items
             ]

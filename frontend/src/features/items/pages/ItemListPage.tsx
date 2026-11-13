@@ -58,7 +58,7 @@ export function ItemListPage() {
               <Tr key={i.id}>
                 <Td><p className="font-medium">{i.name}</p><p className="text-xs text-muted-foreground">{titleCase(i.category)} - {titleCase(i.condition)}</p></Td>
                 <Td><Link className="text-primary underline" to={`/containers/${i.container_id}`}>Container #{i.container_id}</Link></Td>
-                <Td className="text-right tabular-nums">{formatNumber(i.weight, 3)} kg</Td>
+                <Td className="text-right tabular-nums">{i.weight == null ? '-' : `${formatNumber(i.weight, 3)} kg`}</Td>
                 <Td className="text-right tabular-nums">{formatMoney(i.landed_cost)}</Td>
                 <Td>{i.sold ? <Badge tone="success">Sold {formatMoney(i.selling_price)}</Badge> : <Badge>In stock</Badge>}</Td>
               </Tr>

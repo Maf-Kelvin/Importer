@@ -1,4 +1,3 @@
-
 import logging
 import logging.config
 from contextlib import asynccontextmanager
@@ -8,9 +7,6 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 from prometheus_client import make_asgi_app
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 
@@ -77,15 +73,6 @@ if settings.SENTRY_DSN:
         send_default_pii=False,
     )
     logger.info("Sentry initialised (env=%s)", settings.ENVIRONMENT)
-
-
-# ------------------------------------------------------------------------------
-# Rate limiter — keyed by IP by default; per-user keying done in routers
-# ------------------------------------------------------------------------------
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=[settings.RATE_LIMIT_API],
-)
 
 
 # ------------------------------------------------------------------------------
@@ -193,14 +180,7 @@ app = FastAPI(
 )
 
 
-# ------------------------------------------------------------------------------
-# Rate limiter
-# ------------------------------------------------------------------------------
-app.state.limiter = limiter
-app.add_exception_handler(
-    RateLimitExceeded,
-    _rate_limit_exceeded_handler,
-)
+# Rate limiting is done by nginx (docker/nginx/nginx.conf), not in the app.
 
 
 @app.exception_handler(FXRateUnavailable)

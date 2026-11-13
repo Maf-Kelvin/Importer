@@ -31,4 +31,4 @@ api_router.include_router(files.router,      prefix="/files",      tags=["Files"
 api_router.include_router(audit.router,      prefix="/audit-logs", tags=["Audit"])
 api_router.include_router(organizations.router, prefix="/organizations", tags=["Organizations"])
 api_router.include_router(customers.router,  prefix="/customers",  tags=["Customers"])
-# /health and /ready are mounted directly on app in main.py (outside rate limiter)
+# /health and /ready are mounted directly on app in main.py (outside nginx rate limits)

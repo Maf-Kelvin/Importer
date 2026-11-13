@@ -54,7 +54,7 @@ export function ItemsSection({ containerId, items }: { containerId: number; item
                   <p className="font-medium">{i.name}</p>
                   <p className="text-xs text-muted-foreground">{titleCase(i.category)} - {titleCase(i.condition)}</p>
                 </Td>
-                <Td className="text-right tabular-nums">{formatNumber(i.weight, 3)} kg</Td>
+                <Td className="text-right tabular-nums">{i.weight == null ? '-' : `${formatNumber(i.weight, 3)} kg`}</Td>
                 <Td className="text-right tabular-nums">{formatMoney(i.purchase_price, i.purchase_currency)}</Td>
                 <Td className="text-right tabular-nums">{formatMoney(i.allocated_cost)}</Td>
                 <Td className="text-right tabular-nums">{formatMoney(i.landed_cost)}</Td>

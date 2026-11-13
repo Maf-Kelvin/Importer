@@ -4,6 +4,7 @@ from datetime import date, datetime, UTC
 from typing import Any, Optional
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -27,6 +28,10 @@ ITEM_FIELDS = ("container_id", "name", "category", "condition", "purchase_price"
                "fx_rate_to_usd", "purchase_price_usd", "weight", "volume", "selling_price", "sold")
 
 logger = logging.getLogger(__name__)
+
+
+class ItemAlreadySoldError(ValueError):
+    """Another request sold this item first (maps to HTTP 409)."""
 
 
 class ContainerService:
@@ -451,30 +456,35 @@ class ContainerService:
             if customer is None:
                 raise ValueError("Customer not found")
 
-        async with transaction(self.db):
-            sold_at = datetime.combine(
-                data.sold_date or date.today(), datetime.min.time()
-            ).replace(tzinfo=UTC)
+        try:
+            async with transaction(self.db):
+                sold_at = datetime.combine(
+                    data.sold_date or date.today(), datetime.min.time()
+                ).replace(tzinfo=UTC)
 
-            item.sold          = True
-            item.selling_price = data.selling_price
-            item.sold_date     = data.sold_date or date.today()
+                item.sold          = True
+                item.selling_price = data.selling_price
+                item.sold_date     = data.sold_date or date.today()
 
-            # Create dedicated Sale record
-            sale = Sale(
-                tenant_id=current_user.tenant_id,
-                item_id=item.id,
-                customer_id=data.customer_id,
-                sold_by=current_user.id,
-                sale_price=data.selling_price,
-                currency="USD",
-                sold_at=sold_at,
-                notes=data.notes,
-            )
-            self.db.add(sale)
-            self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="item.sold",
-                           entity_type="Item", entity_id=item.id,
-                           changes={"selling_price": str(data.selling_price), "sold_date": str(item.sold_date)})
+                # Create dedicated Sale record
+                sale = Sale(
+                    tenant_id=current_user.tenant_id,
+                    item_id=item.id,
+                    customer_id=data.customer_id,
+                    sold_by=current_user.id,
+                    sale_price=data.selling_price,
+                    currency="USD",
+                    sold_at=sold_at,
+                    notes=data.notes,
+                )
+                self.db.add(sale)
+                self.audit.add(tenant_id=current_user.tenant_id, user_id=current_user.id, action="item.sold",
+                               entity_type="Item", entity_id=item.id,
+                               changes={"selling_price": str(data.selling_price), "sold_date": str(item.sold_date)})
+
+        except IntegrityError as exc:
+            # Sale.item_id is unique: a concurrent request already recorded the sale
+            raise ItemAlreadySoldError("Item was already sold by another request") from exc
 
         await self.db.refresh(item)
         logger.info(

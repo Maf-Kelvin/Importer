@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import security
+from app.core.token_claims import claims_match_user, parse_subject
 from app.core.database import get_db
 from app.models.user import User, UserRole
 
@@ -52,14 +53,18 @@ async def get_current_user(
     if not security.verify_token_type(payload, security.ACCESS_TOKEN_TYPE):
         raise _CREDENTIALS_EXC
 
-    username: str | None = payload.get("sub")
-    if not username:
+    user_id = parse_subject(payload)
+    if user_id is None:
         raise _CREDENTIALS_EXC
 
     # 4. Load user from DB
-    result = await db.execute(select(User).where(User.username == username))
+    result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if user is None:
+        raise _CREDENTIALS_EXC
+
+    # 5. Token must belong to this user, tenant and current password
+    if not claims_match_user(payload, user):
         raise _CREDENTIALS_EXC
 
     return user

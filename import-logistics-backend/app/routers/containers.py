@@ -136,7 +136,7 @@ async def allocate_costs(
     try:
         result = await svc.allocate_costs(container_id, allocation_method, current_user)
     except AllocationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        raise HTTPException(status_code=422, detail=str(exc))
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Container not found")
     return result

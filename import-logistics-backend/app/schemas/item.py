@@ -1,4 +1,3 @@
-
 # app/schemas/item.py
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ class ItemBase(BaseModel):
     purchase_price: PositiveMoney
     purchase_currency: str = Field(..., min_length=3, max_length=3)
     purchase_date: Optional[date] = None
-    weight: Weight
+    weight: Optional[Weight] = None
     volume: Optional[Weight] = None
 
 

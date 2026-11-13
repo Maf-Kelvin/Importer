@@ -9,6 +9,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import security
+from app.core.token_claims import claims_match_user, parse_subject, password_fingerprint
 from app.core.config import settings
 from app.routers.deps import DBDep, get_current_active_user
 from app.schemas.user import (
@@ -79,16 +80,19 @@ async def login(
             detail="Account is inactive",
         )
 
+    pwf = password_fingerprint(user.hashed_password)
     access_token = security.create_access_token(
-        subject=user.username,
+        subject=str(user.id),
         tenant_id=user.tenant_id,
         role=user.role.value,
         expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+        pwf=pwf,
     )
     refresh_token = security.create_refresh_token(
-        subject=user.username,
+        subject=str(user.id),
         tenant_id=user.tenant_id,
         expires_delta=timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES),
+        pwf=pwf,
     )
 
     if _cookie_mode(request):
@@ -140,15 +144,19 @@ async def refresh_token(
             detail="Invalid token type",
         )
 
-    username: str = payload.get("sub", "")
-    tenant_id: int = payload.get("tenant_id", 0)
-
+    user_id = parse_subject(payload)
     svc  = AuthService(db)
-    user = await svc.get_user_by_username(username)
+    user = await svc.get_user_by_id(user_id) if user_id is not None else None
     if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive",
+        )
+    # Rejects tokens issued before a password change, or to a different tenant
+    if not claims_match_user(payload, user):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token",
         )
 
     # Rotate: revoke the old refresh token ATOMICALLY. Checking "is it revoked?" and revoking it
@@ -161,14 +169,17 @@ async def refresh_token(
             detail="Refresh token has been revoked",
         )
 
+    pwf = password_fingerprint(user.hashed_password)
     new_access = security.create_access_token(
-        subject=user.username,
+        subject=str(user.id),
         tenant_id=user.tenant_id,
         role=user.role.value,
+        pwf=pwf,
     )
     new_refresh = security.create_refresh_token(
-        subject=user.username,
+        subject=str(user.id),
         tenant_id=user.tenant_id,
+        pwf=pwf,
     )
 
     if cookie_mode:
@@ -195,7 +206,7 @@ async def logout(
 ):
     """Revoke the tokens the caller presents and clear the session cookie.
 
-    Deliberately NOT behind authentication: a user whose 30-minute access token has expired
+    Deliberately NOT behind authentication: a user whose short-lived access token has expired
     must still be able to sign out (the refresh cookie is the credential that needs revoking),
     and it can only ever revoke tokens the caller already holds."""
     # Blacklist the access token from the Authorization header

@@ -95,7 +95,7 @@ export interface Item {
   purchase_price: number;
   purchase_currency: string;
   purchase_date: string | null;
-  weight: number;
+  weight: number | null;
   volume: number | null;
   fx_rate_to_usd: number;
   purchase_price_usd: number;
@@ -175,7 +175,7 @@ export interface ItemCreate {
   purchase_price: string;
   purchase_currency: string;
   purchase_date?: string | null;
-  weight: string;
+  weight?: string | null;
   volume?: string | null;
 }
 export type ItemUpdate = Partial<Omit<ItemCreate, 'container_id'>>;

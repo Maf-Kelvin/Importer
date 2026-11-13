@@ -1,4 +1,5 @@
 # app/core/security.py
+import uuid
 from datetime import datetime, timedelta, UTC
 from typing import Optional
 from jose import jwt, JWTError
@@ -31,6 +32,7 @@ def create_access_token(
     tenant_id: int,
     role: str,
     expires_delta: Optional[timedelta] = None,
+    pwf: Optional[str] = None,
 ) -> str:
     expire = datetime.now(UTC) + (
         expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -42,7 +44,12 @@ def create_access_token(
         "type":      ACCESS_TOKEN_TYPE,
         "exp":       expire,
         "iat":       datetime.now(UTC),
+        # unique id: two tokens issued in the same second must still differ, otherwise a
+        # rotated refresh token can be byte-identical to the one just revoked
+        "jti":       uuid.uuid4().hex,
     }
+    if pwf is not None:
+        payload["pwf"] = pwf
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -53,6 +60,7 @@ def create_refresh_token(
     subject: str,
     tenant_id: int,
     expires_delta: Optional[timedelta] = None,
+    pwf: Optional[str] = None,
 ) -> str:
     expire = datetime.now(UTC) + (
         expires_delta or timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES)
@@ -63,7 +71,12 @@ def create_refresh_token(
         "type":      REFRESH_TOKEN_TYPE,
         "exp":       expire,
         "iat":       datetime.now(UTC),
+        # unique id: two tokens issued in the same second must still differ, otherwise a
+        # rotated refresh token can be byte-identical to the one just revoked
+        "jti":       uuid.uuid4().hex,
     }
+    if pwf is not None:
+        payload["pwf"] = pwf
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -117,8 +130,19 @@ async def is_token_blacklisted(token: str) -> bool:
 # ------------------------------------------------------------------------------
 # Account lockout helpers — Redis backed
 # ------------------------------------------------------------------------------
+def login_lock_key(username: str, client_ip: Optional[str]) -> str:
+    """Lockout bucket for one username from one client address.
+
+    Keyed on username AND IP so a stranger cannot lock a real user out of their
+    own account by guessing wrong passwords from elsewhere. (If TRUST_PROXY_HEADERS
+    is off behind a proxy, every client shares the proxy's address and this
+    degrades to the old per-username behaviour.)"""
+    return f"{username.strip().lower()}|{client_ip or '-'}"
+
+
 async def record_failed_login(username: str) -> int:
-    """Increment failed login counter. Returns current count."""
+    """Increment failed login counter. Returns current count.
+    `username` is the bucket from login_lock_key()."""
     r = get_state_redis()
     key = f"login_fail:{username}"
     count = await r.incr(key)

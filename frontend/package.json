@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "npm run typecheck && vite build",
     "preview": "vite preview",
+    "pretypecheck": "npm run api:generate",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
